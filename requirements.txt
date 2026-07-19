@@ -4,3 +4,6 @@ phonenumbers
 beautifulsoup4
 openpyxl
 xlrd
+pyTelegramBotAPI>=4.14.0
+segno
+neonize
