@@ -1,0 +1,6 @@
+pytelegrambotapi
+requests
+phonenumbers
+beautifulsoup4
+openpyxl
+xlrd
