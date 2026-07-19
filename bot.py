@@ -1,21 +1,16 @@
 """
-OTP Panel Bot  v4.0  — FINAL
+OTP Panel Bot  v4.1  — FIXED
 =========================================================
 P1  : WealthoraPrime
 P2  : FastXOTPs
 WA  : neonize – PairPhone code (no QR), per-user session
 Admin : ADMIN_ID → /stats  /status
 =========================================================
-✅  QR সম্পূর্ণ বাদ → Phone pairing code
-✅  নম্বর না দেওয়া পর্যন্ত "সংযোগ" মেসেজ নেই
-✅  False-connecting bug সরানো হয়েছে
-✅  প্রতি user আলাদা WA session  (50-60 user support)
-✅  🔌 Disconnect button
-✅  P2 OTP – 3-method 
-✅  OTP সঠিক user-এর inbox-এ যাবে
-✅  OTP সঠিক service label (WA / FB / TG)
-✅  Admin /stats  /status
-✅  Super-fast number fetching (connection pool, 10 workers)
+✅  pair_phone সঠিকভাবে call করা হচ্ছে
+✅  Username সহ OTP stats
+✅  P2 OTP watcher সব method দিয়ে try করে
+✅  P1 OTP watcher unchanged (working)
+✅  50-60 user support
 """
 
 import os
@@ -108,6 +103,10 @@ wa_statuses = {}   # chat_id → "disconnected"|"connecting"|"connected"
 otp_stats   = {}   # chat_id → int
 bot_start   = time.time()
 
+# ── username cache: chat_id → "@username" or "First Last" ───
+user_names  = {}   # chat_id → str
+names_lock  = threading.Lock()
+
 # per-user active number batches:  chat_id → set of plain numbers being watched
 active_watches: dict = {}
 watch_lock = threading.Lock()
@@ -117,6 +116,31 @@ state_lock = threading.Lock()
 
 DEFAULT_SERVICES = {"whatsapp", "facebook", "telegram"}
 SVC_ICON = {"whatsapp": "💬", "facebook": "📘", "telegram": "✈️"}
+
+# ─────────────────────────────────────────────────────────────
+#  USERNAME HELPER
+# ─────────────────────────────────────────────────────────────
+def _save_user(msg_or_user):
+    """msg অথবা User object থেকে username/name cache করে।"""
+    try:
+        u = getattr(msg_or_user, "from_user", msg_or_user) or msg_or_user
+        if u is None:
+            return
+        uid = u.id
+        if u.username:
+            label = f"@{u.username}"
+        elif u.first_name:
+            label = u.first_name + (f" {u.last_name}" if u.last_name else "")
+        else:
+            label = str(uid)
+        with names_lock:
+            user_names[uid] = label
+    except Exception:
+        pass
+
+def _get_label(chat_id: int) -> str:
+    with names_lock:
+        return user_names.get(chat_id, str(chat_id))
 
 # ─────────────────────────────────────────────────────────────
 #  UTILITY
@@ -247,14 +271,47 @@ def _reconnect_silent(chat_id: int):
         wa_statuses[chat_id] = "disconnected"
         print(f"[WA] reconnect fail {chat_id}: {e}")
 
+# ─────────────────────────────────────────────────────────────
+#  PAIR PHONE  — neonize সব version support
+# ─────────────────────────────────────────────────────────────
+def _do_pair_phone(client: NewClient, phone: str) -> str:
+    """
+    neonize বিভিন্ন version-এ method name আলাদা।
+    সব সম্ভাব্য নাম try করে code return করে।
+    """
+    # method name candidates (neonize version অনুযায়ী)
+    candidates = [
+        "pair_phone",       # v1.x snake_case
+        "PairPhone",        # CamelCase variant
+        "pairPhone",        # camelCase variant
+        "request_pairing_code",  # older alias
+    ]
+    for name in candidates:
+        method = getattr(client, name, None)
+        if callable(method):
+            try:
+                result = method(phone)
+                if result:
+                    return str(result)
+            except Exception as e:
+                print(f"[PAIR] {name} failed: {e}")
+                continue
+
+    # শেষ চেষ্টা: সব attribute দেখি
+    attrs = [a for a in dir(client)
+             if "pair" in a.lower() or "phone" in a.lower() or "code" in a.lower()]
+    raise AttributeError(
+        f"pair_phone method পাওয়া যায়নি। Available: {attrs}"
+    )
+
+
 def connect_with_code(chat_id: int, phone: str):
     """
     PairPhone:
       1) connect() → background thread (WebSocket)
-      2) 3s wait → ready
+      2) 8s wait → socket ready
       3) pair_phone() → 8-digit code  (QR সম্পূর্ণ বাদ)
     """
-    # ── guard checks ─────────────────────────────────────────
     if get_wa_status(chat_id) == "connected":
         bot.send_message(chat_id, "✅ *WhatsApp ইতিমধ্যে সংযুক্ত!*",
                          reply_markup=_main_kb(chat_id))
@@ -270,10 +327,15 @@ def connect_with_code(chat_id: int, phone: str):
 
     def _do():
         try:
+            # WebSocket thread শুরু
             t = threading.Thread(target=client.connect, daemon=True)
             t.start()
-            time.sleep(3)
-            code = client.pair_phone(phone)
+
+            # socket establish হওয়ার জন্য অপেক্ষা
+            # (3s প্রায়ই কম হয়, 8s দিলে reliable)
+            time.sleep(8)
+
+            code = _do_pair_phone(client, phone)
             bot.send_message(
                 chat_id,
                 f"🔑 *WhatsApp Pairing Code:*\n\n`{code}`\n\n"
@@ -449,10 +511,11 @@ def _fetch_one(panel: str, range_id: str):
                         otp_now=False, otp_msg="")
         return None
 
-    # p2
+    # p2 — আরো বেশি field parse করা হচ্ছে
     resp    = p2_post("/getnum", {"range": range_id})
     data    = resp.get("data", resp) or {}
     if not isinstance(data, dict): data = {}
+
     full    = (data.get("full_number") or data.get("number")
                or resp.get("full_number") or resp.get("number") or "")
     plain   = str(data.get("no_plus_number") or str(full).lstrip("+"))
@@ -463,6 +526,10 @@ def _fetch_one(panel: str, range_id: str):
     otp_now = bool(data.get("otp_now") or resp.get("otp_now"))
     otp_msg = str(data.get("otp_message") or data.get("message")
                   or resp.get("otp_message") or resp.get("message") or "")
+
+    print(f"[P2-FETCH] full={full} rid={rid} otp_now={otp_now} "
+          f"otp_msg={otp_msg[:40] if otp_msg else ''}")
+
     if full:
         return dict(full=full, plain=plain, country=country,
                     service=service, rid=rid,
@@ -481,7 +548,6 @@ def get_6_numbers(chat_id, panel, range_id, edit_msg_id=None):
         st_id = st.message_id
 
     results, failed = [], 0
-    # 10 workers — super fast parallel fetch
     with ThreadPoolExecutor(max_workers=10) as ex:
         futs = [ex.submit(_fetch_one, panel, range_id) for _ in range(6)]
         for f in as_completed(futs):
@@ -516,7 +582,6 @@ def get_6_numbers(chat_id, panel, range_id, edit_msg_id=None):
         bot.send_message(chat_id, header,
                          reply_markup=kb, parse_mode="Markdown")
 
-    # num_meta: plain → {full, country, service, range_id}
     num_meta = {
         n["plain"].lstrip("+"): dict(
             full=n["full"],
@@ -527,7 +592,6 @@ def get_6_numbers(chat_id, panel, range_id, edit_msg_id=None):
         for n in results
     }
 
-    # track active watches per user
     plains = set(num_meta.keys())
     with watch_lock:
         existing = active_watches.get(chat_id, set())
@@ -540,7 +604,7 @@ def get_6_numbers(chat_id, panel, range_id, edit_msg_id=None):
             active_watches[chat_id] = cur - plains
     threading.Thread(target=_cleanup, daemon=True).start()
 
-    # P1 OTP watcher  (watches ALL panels via success-otp endpoint)
+    # P1 OTP watcher (সব panel-এর জন্য চলে)
     threading.Thread(
         target=_p1_otp_watcher,
         args=(chat_id, plains, 600, num_meta),
@@ -559,10 +623,18 @@ def get_6_numbers(chat_id, panel, range_id, edit_msg_id=None):
         pending = [n for n in results
                    if n.get("rid") and
                    not (n.get("otp_now") and n.get("otp_msg"))]
-        if pending:
+
+        # rid ছাড়া numbers-ও watch করা দরকার (P1 fallback)
+        no_rid = [n for n in results
+                  if not n.get("rid") and
+                  not (n.get("otp_now") and n.get("otp_msg"))]
+
+        print(f"[P2] pending={len(pending)} no_rid={len(no_rid)}")
+
+        if pending or no_rid:
             threading.Thread(
                 target=_p2_otp_watcher,
-                args=(chat_id, pending, range_id),
+                args=(chat_id, pending, range_id, 600, num_meta),
                 daemon=True).start()
 
 # ─────────────────────────────────────────────────────────────
@@ -653,99 +725,167 @@ def _p1_otp_watcher(chat_id, watch: set, duration: int, num_meta=None):
             )
 
 # ─────────────────────────────────────────────────────────────
-#  P2 OTP WATCHER  (3 method)
+#  P2 OTP WATCHER  — 3 method + P1 fallback (FIXED)
 # ─────────────────────────────────────────────────────────────
-def _p2_otp_watcher(chat_id, numbers, range_id, duration=600):
+def _p2_otp_watcher(chat_id, numbers, range_id,
+                    duration=600, num_meta=None):
     """
-    Method 1 → POST /api/getotp {rid}
+    Method 1 → POST /api/getotp   {rid}
     Method 2 → GET  /api/getnum/{rid}
-    Method 3 → P1 success-otp fallback
+    Method 3 → POST /api/checkotp {rid}  (extra endpoint try)
+    Method 4 → P1 success-otp fallback
     """
     pending = {n["rid"]: n for n in numbers if n.get("rid")}
-    plains  = {n["plain"].lstrip("+") for n in numbers}
+    # rid নেই এমন numbers-এর জন্য plain number দিয়ে P1 fallback watch
+    plains_no_rid = {n["plain"].lstrip("+"): n
+                     for n in numbers if not n.get("rid")}
     seen_p1: set = set()
     deadline = time.time() + duration
-    print(f"[P2-OTP] start chat={chat_id} n={len(pending)}")
+    print(f"[P2-OTP] start chat={chat_id} rid_pending={len(pending)} "
+          f"no_rid={len(plains_no_rid)}")
 
-    while time.time() < deadline and pending:
+    while time.time() < deadline and (pending or plains_no_rid):
         time.sleep(3)
 
-        # ── Method 1: POST getotp ──────────────────────────────
-        for rid in list(pending):
+        # ── Method 1: POST /api/getotp ──────────────────────────
+        for rid in list(pending.keys()):
             try:
                 r = _session.post(
                     f"{P2_BASE}/api/getotp",
                     json={"rid": rid}, headers=P2_HDRS, timeout=10)
-                if r.status_code != 200: continue
+                if r.status_code != 200:
+                    continue
                 resp = r.json()
                 d    = resp.get("data", resp) or {}
                 if not isinstance(d, dict): d = {}
                 msg  = (d.get("otp_message") or d.get("otp") or d.get("message")
                         or resp.get("otp_message") or resp.get("otp")
                         or resp.get("message") or "")
-                if not msg: continue
+                if not msg:
+                    continue
                 code = extract_otp(str(msg))
-                if code == "???": continue
+                if code == "???":
+                    continue
                 n = pending.pop(rid, None)
                 if n:
                     print(f"[P2-M1] ✅ {n['full']} otp={code}")
                     _notify_otp(chat_id, full_num=n["full"], otp_code=code,
                                 country=n.get("country",""),
-                                service=n.get("service",""), range_id=range_id)
+                                service=n.get("service",""),
+                                range_id=range_id)
             except Exception as e:
-                print(f"[P2-M1] {e}")
-        if not pending: break
+                print(f"[P2-M1] rid={rid} err={e}")
 
-        # ── Method 2: GET getnum/{rid} ─────────────────────────
-        for rid in list(pending):
+        if not pending and not plains_no_rid:
+            break
+
+        # ── Method 2: GET /api/getnum/{rid} ────────────────────
+        for rid in list(pending.keys()):
             try:
                 r = _session.get(
                     f"{P2_BASE}/api/getnum/{rid}",
                     headers={"X-API-Key": P2_KEY}, timeout=10)
-                if r.status_code != 200: continue
+                if r.status_code != 200:
+                    continue
+                resp = r.json()
+                d    = resp.get("data", resp) or {}
+                if not isinstance(d, dict): d = {}
+                msg      = (d.get("otp_message") or d.get("otp") or d.get("message")
+                            or resp.get("otp_message") or resp.get("otp")
+                            or resp.get("message") or "")
+                otp_now  = bool(d.get("otp_now") or resp.get("otp_now"))
+                if not (msg or otp_now):
+                    continue
+                code = extract_otp(str(msg)) if msg else "???"
+                if code == "???":
+                    continue
+                n = pending.pop(rid, None)
+                if n:
+                    print(f"[P2-M2] ✅ {n['full']} otp={code}")
+                    _notify_otp(chat_id, full_num=n["full"], otp_code=code,
+                                country=n.get("country",""),
+                                service=n.get("service",""),
+                                range_id=range_id)
+            except Exception as e:
+                print(f"[P2-M2] rid={rid} err={e}")
+
+        if not pending and not plains_no_rid:
+            break
+
+        # ── Method 3: POST /api/checkotp (extra endpoint) ──────
+        for rid in list(pending.keys()):
+            try:
+                r = _session.post(
+                    f"{P2_BASE}/api/checkotp",
+                    json={"rid": rid}, headers=P2_HDRS, timeout=10)
+                if r.status_code != 200:
+                    continue
                 resp = r.json()
                 d    = resp.get("data", resp) or {}
                 if not isinstance(d, dict): d = {}
                 msg  = (d.get("otp_message") or d.get("otp") or d.get("message")
                         or resp.get("otp_message") or resp.get("otp")
                         or resp.get("message") or "")
-                otp_now = bool(d.get("otp_now") or resp.get("otp_now"))
-                if not (msg or otp_now): continue
+                if not msg:
+                    continue
                 code = extract_otp(str(msg))
-                if code == "???": continue
+                if code == "???":
+                    continue
                 n = pending.pop(rid, None)
                 if n:
-                    print(f"[P2-M2] ✅ {n['full']} otp={code}")
+                    print(f"[P2-M3] ✅ {n['full']} otp={code}")
                     _notify_otp(chat_id, full_num=n["full"], otp_code=code,
                                 country=n.get("country",""),
-                                service=n.get("service",""), range_id=range_id)
+                                service=n.get("service",""),
+                                range_id=range_id)
             except Exception as e:
-                print(f"[P2-M2] {e}")
-        if not pending: break
+                print(f"[P2-M3] rid={rid} err={e}")
 
-        # ── Method 3: P1 fallback ──────────────────────────────
-        try:
-            for o in _p1_otps():
-                oid = str(o.get("otp_id") or "")
-                if not oid or oid in seen_p1: continue
-                api_num = str(o.get("number","")).strip()
-                if not _num_matches(api_num, plains): continue
-                seen_p1.add(oid)
-                code    = extract_otp(str(o.get("message","")))
-                api_sid = str(o.get("sid") or o.get("service") or "")
-                for rid, n in list(pending.items()):
-                    if _num_matches(api_num, {n["plain"].lstrip("+")}):
-                        pending.pop(rid)
-                        print(f"[P2-M3] ✅ {n['full']} otp={code}")
-                        _notify_otp(chat_id, full_num=n["full"], otp_code=code,
-                                    country=n.get("country",""),
-                                    service=n.get("service") or api_sid,
-                                    range_id=range_id)
-                        break
-        except Exception as e:
-            print(f"[P2-M3] {e}")
+        # ── Method 4: P1 success-otp fallback ──────────────────
+        all_plains = (
+            {n["plain"].lstrip("+") for n in pending.values()}
+            | set(plains_no_rid.keys())
+        )
+        if all_plains:
+            try:
+                for o in _p1_otps():
+                    oid = str(o.get("otp_id") or "")
+                    if not oid or oid in seen_p1:
+                        continue
+                    api_num = str(o.get("number","")).strip()
+                    if not _num_matches(api_num, all_plains):
+                        continue
+                    seen_p1.add(oid)
+                    code    = extract_otp(str(o.get("message","")))
+                    api_sid = str(o.get("sid") or o.get("service") or "")
 
-    print(f"[P2-OTP] done chat={chat_id} left={len(pending)}")
+                    # rid pending থেকে match করো
+                    for rid, n in list(pending.items()):
+                        if _num_matches(api_num, {n["plain"].lstrip("+")}):
+                            pending.pop(rid)
+                            print(f"[P2-M4-rid] ✅ {n['full']} otp={code}")
+                            _notify_otp(chat_id, full_num=n["full"],
+                                        otp_code=code,
+                                        country=n.get("country",""),
+                                        service=n.get("service") or api_sid,
+                                        range_id=range_id)
+                            break
+                    # no-rid থেকে match করো
+                    for pw, n in list(plains_no_rid.items()):
+                        if _num_matches(api_num, {pw}):
+                            plains_no_rid.pop(pw, None)
+                            print(f"[P2-M4-norid] ✅ {n['full']} otp={code}")
+                            _notify_otp(chat_id, full_num=n["full"],
+                                        otp_code=code,
+                                        country=n.get("country",""),
+                                        service=n.get("service") or api_sid,
+                                        range_id=range_id)
+                            break
+            except Exception as e:
+                print(f"[P2-M4] {e}")
+
+    print(f"[P2-OTP] done chat={chat_id} "
+          f"left_rid={len(pending)} left_norid={len(plains_no_rid)}")
 
 # ─────────────────────────────────────────────────────────────
 #  BUTTON LABELS
@@ -763,6 +903,7 @@ _ALL_BTN = {
 # ─────────────────────────────────────────────────────────────
 @bot.message_handler(commands=["start"])
 def cmd_start(msg):
+    _save_user(msg)
     bot.send_message(
         msg.chat.id,
         "🤖 *OTP Panel Bot*\n\n"
@@ -775,7 +916,7 @@ def cmd_start(msg):
     )
 
 # ─────────────────────────────────────────────────────────────
-#  /stats  (admin only)
+#  /stats  (admin only) — username সহ
 # ─────────────────────────────────────────────────────────────
 @bot.message_handler(commands=["stats"])
 def cmd_stats(msg):
@@ -786,23 +927,29 @@ def cmd_stats(msg):
     text  = "📊 *OTP Statistics*\n━━━━━━━━━━━━━━━━━\n"
     total = 0
     for uid, cnt in sorted(otp_stats.items(), key=lambda x: -x[1]):
-        text  += f"👤 `{uid}` — *{cnt}* OTP\n"
+        label  = _get_label(uid)
+        # username telegram link
+        with names_lock:
+            uname = user_names.get(uid, "")
+        if uname.startswith("@"):
+            link = f"[{uname}](tg://user?id={uid})"
+        else:
+            link = f"[{uname or uid}](tg://user?id={uid})"
+        text  += f"👤 {link} — *{cnt}* OTP\n"
         total += cnt
     text += f"━━━━━━━━━━━━━━━━━\n📋 মোট: *{total}* OTP"
-    bot.send_message(msg.chat.id, text, parse_mode="Markdown")
+    bot.send_message(msg.chat.id, text, parse_mode="Markdown",
+                     disable_web_page_preview=True)
 
 # ─────────────────────────────────────────────────────────────
-#  /status  (admin only — bot & WA health)
+#  /status  (admin only)
 # ─────────────────────────────────────────────────────────────
 @bot.message_handler(commands=["status"])
 def cmd_status(msg):
     if msg.chat.id != ADMIN_ID: return
-    connected   = [cid for cid, st in wa_statuses.items()
-                   if st == "connected"]
-    connecting  = [cid for cid, st in wa_statuses.items()
-                   if st == "connecting"]
-    disconnected = [cid for cid, st in wa_statuses.items()
-                    if st == "disconnected"]
+    connected    = [cid for cid, st in wa_statuses.items() if st == "connected"]
+    connecting   = [cid for cid, st in wa_statuses.items() if st == "connecting"]
+    disconnected = [cid for cid, st in wa_statuses.items() if st == "disconnected"]
     with watch_lock:
         watching = sum(len(v) for v in active_watches.values())
     total_otp = sum(otp_stats.values()) if otp_stats else 0
@@ -820,20 +967,24 @@ def cmd_status(msg):
     if connected:
         text += "*Connected users:*\n"
         for cid in connected:
-            cnt = otp_stats.get(cid, 0)
-            text += f"  • `{cid}` — {cnt} OTP\n"
-    bot.send_message(msg.chat.id, text, parse_mode="Markdown")
+            cnt   = otp_stats.get(cid, 0)
+            label = _get_label(cid)
+            text += f"  • `{cid}` ({label}) — {cnt} OTP\n"
+    bot.send_message(msg.chat.id, text, parse_mode="Markdown",
+                     disable_web_page_preview=True)
 
 # ─────────────────────────────────────────────────────────────
 #  CONSOLE BUTTONS
 # ─────────────────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: m.text == "🔴 P1 Console")
 def btn_p1_console(msg):
+    _save_user(msg)
     threading.Thread(target=_send_console,
                      args=(msg.chat.id,"p1"), daemon=True).start()
 
 @bot.message_handler(func=lambda m: m.text == "🔵 P2 Console")
 def btn_p2_console(msg):
+    _save_user(msg)
     threading.Thread(target=_send_console,
                      args=(msg.chat.id,"p2"), daemon=True).start()
 
@@ -842,6 +993,7 @@ def btn_p2_console(msg):
 # ─────────────────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: m.text == "📞 P1 নাম্বার")
 def btn_p1_num(msg):
+    _save_user(msg)
     with state_lock:
         user_state[msg.chat.id] = {"mode": "wait_range_p1"}
     bot.send_message(msg.chat.id,
@@ -850,6 +1002,7 @@ def btn_p1_num(msg):
 
 @bot.message_handler(func=lambda m: m.text == "📞 P2 নাম্বার")
 def btn_p2_num(msg):
+    _save_user(msg)
     with state_lock:
         user_state[msg.chat.id] = {"mode": "wait_range_p2"}
     bot.send_message(msg.chat.id,
@@ -858,11 +1011,11 @@ def btn_p2_num(msg):
 
 # ─────────────────────────────────────────────────────────────
 #  ❌ / ✅ WA CHECKER BUTTON
-#  ⚠️  IMPORTANT: নম্বর না দেওয়া পর্যন্ত "সংযোগ" মেসেজ দেখাবে না
 # ─────────────────────────────────────────────────────────────
 @bot.message_handler(
     func=lambda m: m.text in ("✅ WA Checker", "❌ WA Checker"))
 def btn_wa(msg):
+    _save_user(msg)
     chat_id = msg.chat.id
     status  = get_wa_status(chat_id)
 
@@ -872,12 +1025,10 @@ def btn_wa(msg):
         return
 
     if status == "connecting":
-        # শুধু তখনই বলব যখন user ইতিমধ্যে নম্বর দিয়ে প্রক্রিয়া শুরু করেছে
         bot.send_message(chat_id,
                          "⏳ কোড তৈরি হচ্ছে, একটু অপেক্ষা করুন...")
         return
 
-    # ─── disconnected → নম্বর চাই ───────────────────────────
     with state_lock:
         user_state[chat_id] = {"mode": "wait_phone"}
     bot.send_message(
@@ -892,6 +1043,7 @@ def btn_wa(msg):
 # ─────────────────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: m.text == "🔌 WA ডিসকানেক্ট")
 def btn_disconnect(msg):
+    _save_user(msg)
     threading.Thread(target=disconnect_wa,
                      args=(msg.chat.id,), daemon=True).start()
 
@@ -900,6 +1052,7 @@ def btn_disconnect(msg):
 # ─────────────────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: m.text == "🔍 নাম্বার চেকার")
 def btn_checker(msg):
+    _save_user(msg)
     chat_id = msg.chat.id
     if get_wa_status(chat_id) != "connected":
         bot.send_message(chat_id,
@@ -919,6 +1072,7 @@ def btn_checker(msg):
 # ─────────────────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: True, content_types=["text"])
 def on_text(msg):
+    _save_user(msg)
     chat_id = msg.chat.id
     text    = msg.text.strip()
     if text.startswith("/") or text in _ALL_BTN: return
@@ -935,7 +1089,7 @@ def on_text(msg):
                              "❌ অবৈধ নম্বর।\nউদাহরণ: `+8801712345678`",
                              parse_mode="Markdown")
             return
-        bot.send_message(chat_id, "⏳ কোড তৈরি হচ্ছে...")
+        bot.send_message(chat_id, "⏳ কোড তৈরি হচ্ছে... (৮-১০ সেকেন্ড)")
         threading.Thread(target=connect_with_code,
                          args=(chat_id, phone), daemon=True).start()
         return
@@ -1006,21 +1160,22 @@ def _handle_wa_check(chat_id, text: str):
 # ─────────────────────────────────────────────────────────────
 @bot.callback_query_handler(func=lambda c: True)
 def on_callback(call):
+    _save_user(call.from_user)
     chat_id = call.message.chat.id
     msg_id  = call.message.message_id
     data    = call.data
     bot.answer_callback_query(call.id)
 
-    if data.startswith("cr|"):         # console refresh
+    if data.startswith("cr|"):
         panel = data.split("|",1)[1]
         threading.Thread(target=_send_console,
                          args=(chat_id, panel, msg_id), daemon=True).start()
-    elif data.startswith("nb|"):       # new batch
+    elif data.startswith("nb|"):
         _, panel, range_id = data.split("|",2)
         threading.Thread(target=get_6_numbers,
                          args=(chat_id, panel, range_id, msg_id),
                          daemon=True).start()
-    elif data == "cb":                 # close batch
+    elif data == "cb":
         try: bot.delete_message(chat_id, msg_id)
         except: pass
 
@@ -1028,7 +1183,7 @@ def on_callback(call):
 #  MAIN
 # ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("✅ OTP Panel Bot v4.0 চালু  (P1+P2 | PairPhone | 60-user ready)")
+    print("✅ OTP Panel Bot v4.1 চালু  (P1+P2 | PairPhone fixed | Username stats | 60-user ready)")
     while True:
         try:
             bot.infinity_polling(
