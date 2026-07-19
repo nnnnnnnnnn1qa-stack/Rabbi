@@ -3,7 +3,6 @@ OTP Panel Bot — Final
 Panels : P1 (WealthoraPrime) + P2 (FastXOTPs)
 WA     : neonize QR-based login + bulk checker
 """
-dhdjdjdhd
 import io, os, re, time, threading, logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
