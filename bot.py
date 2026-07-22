@@ -1,16 +1,15 @@
 """
-OTP Panel Bot  v5.0  — ULTRA FAST
+OTP Panel Bot v6.0 — ULTRA FAST
 =========================================================
-P1  : WealthoraPrime    → success-otp     (1s global poll)
-P2  : FastXOTPs        → success-otp-info (1s global poll)
+P1  : WealthoraPrime    → OLD নাম্বার + Console (1s global poll)
+P2  : FastXOTPs        → Console only            (1s global poll)
 WA  : neonize – PairPhone code (no QR), per-user session
 Admin : ADMIN_ID → /stats  /status
 =========================================================
 ✅  Global P2 poller  — 1 টা thread, সব user-এর জন্য, 1s interval
 ✅  Global P1 poller  — 1 টা thread, সব user-এর জন্য, 1s interval
-✅  70–80 concurrent user support
+✅  OLD নাম্বার — 30টা parallel fetch → WA check → 5টা WA নাম্বার
 ✅  OTP panel-এ আসার ≤1s এ user পায়
-✅  নম্বর fetch — 6টা parallel (fast)
 ✅  WA Checker unchanged (working)
 """
 
@@ -55,7 +54,7 @@ if not BOT_TOKEN:
 logging.basicConfig(level=logging.WARNING)
 logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown",
-                      num_threads=80)   # 70-80 user handle করতে
+                      num_threads=80)
 
 # ─────────────────────────────────────────────────────────────
 #  HTTP SESSIONS
@@ -72,10 +71,7 @@ def _make_session(pool_conn=50, pool_max=100, retries=2,
     s.mount("https://", adapter)
     return s
 
-# General session (P1 + misc)
-_session = _make_session(pool_conn=50, pool_max=100)
-
-# P2 session — no retry, fast fail
+_session  = _make_session(pool_conn=50, pool_max=100)
 _p2_sess  = _make_session(pool_conn=10, pool_max=20,
                            retries=0, force_list=())
 
@@ -105,9 +101,9 @@ def p2_post(path, data=None):
 # ─────────────────────────────────────────────────────────────
 #  GLOBAL STATE
 # ─────────────────────────────────────────────────────────────
-wa_clients  = {}   # chat_id → NewClient
-wa_statuses = {}   # chat_id → "disconnected"|"connecting"|"connected"
-otp_stats   = {}   # chat_id → int
+wa_clients  = {}
+wa_statuses = {}
+otp_stats   = {}
 bot_start   = time.time()
 
 user_names  = {}
@@ -116,25 +112,19 @@ names_lock  = threading.Lock()
 user_state  = {}
 state_lock  = threading.Lock()
 
-active_watches: dict = {}
-watch_lock = threading.Lock()
-
 DEFAULT_SERVICES = {"whatsapp", "facebook", "telegram"}
 SVC_ICON = {"whatsapp": "💬", "facebook": "📘", "telegram": "✈️"}
 
 # ─────────────────────────────────────────────────────────────
 #  GLOBAL OTP WATCH REGISTRIES
-#  প্রতিটি entry: plain_number → info dict
-#  info = {chat_id, full, country, service, range_id, deadline, panel}
 # ─────────────────────────────────────────────────────────────
-_p1_registry: dict = {}   # plain → info
-_p2_registry: dict = {}   # plain → info
+_p1_registry: dict = {}
+_p2_registry: dict = {}
 _p1_reg_lock = threading.Lock()
 _p2_reg_lock = threading.Lock()
 
 def _register_numbers(panel: str, results: list, range_id: str,
                       chat_id: int, duration: int = 600):
-    """নম্বরগুলো global poller registry-তে add করে।"""
     deadline = time.time() + duration
     lock = _p1_reg_lock if panel == "p1" else _p2_reg_lock
     reg  = _p1_registry  if panel == "p1" else _p2_registry
@@ -150,12 +140,9 @@ def _register_numbers(panel: str, results: list, range_id: str,
                 "deadline": deadline,
             }
 
-def _unregister(panel: str, plains: set):
-    lock = _p1_reg_lock if panel == "p1" else _p2_reg_lock
-    reg  = _p1_registry  if panel == "p1" else _p2_registry
-    with lock:
-        for p in plains:
-            reg.pop(p, None)
+def _register(panel: str, results: list, range_id: str,
+              chat_id: int, dur: int = 600):
+    _register_numbers(panel, results, range_id, chat_id, duration=dur)
 
 # ─────────────────────────────────────────────────────────────
 #  USERNAME / UTILITY HELPERS
@@ -217,7 +204,7 @@ def _inc_otp(chat_id):
 def get_wa_status(chat_id) -> str:
     return wa_statuses.get(chat_id, "disconnected")
 
-# ─── flags ────────────────────────────────────────────────────
+# ── flags ────────────────────────────────────────────────────
 _FLAG = {
     "ivory coast":"🇨🇮","cameroon":"🇨🇲","madagascar":"🇲🇬","nigeria":"🇳🇬",
     "ghana":"🇬🇭","kenya":"🇰🇪","ethiopia":"🇪🇹","tanzania":"🇹🇿","uganda":"🇺🇬",
@@ -287,7 +274,6 @@ def _notify_otp(chat_id, full_num, otp_code,
 
 # ─────────────────────────────────────────────────────────────
 #  GLOBAL P2 POLLER  — একটাই thread, সব user-এর জন্য
-#  interval: 1 second  |  endpoint: /api/success-otp-info
 # ─────────────────────────────────────────────────────────────
 def _fetch_p2_otps() -> list:
     try:
@@ -305,18 +291,16 @@ def _fetch_p2_otps() -> list:
         return []
 
 def _global_p2_poller():
-    """Bot start হওয়ার সময় যেসব OTP ইতিমধ্যে আছে সেগুলো skip করি।"""
     seen: set = {str(o.get("otp_id","")) for o in _fetch_p2_otps()
                  if o.get("otp_id")}
     print(f"[P2-POLLER] শুরু। pre-seen={len(seen)}")
 
     while True:
-        time.sleep(1)          # ← 1 সেকেন্ড interval
+        time.sleep(1)
         try:
             with _p2_reg_lock:
                 if not _p2_registry:
-                    continue   # কোনো active user নেই → API call বাঁচাও
-                # expired entries সরাও
+                    continue
                 now = time.time()
                 for k in [k for k, v in _p2_registry.items()
                            if v["deadline"] < now]:
@@ -359,7 +343,6 @@ def _global_p2_poller():
 
 # ─────────────────────────────────────────────────────────────
 #  GLOBAL P1 POLLER  — একটাই thread, সব user-এর জন্য
-#  interval: 1 second  |  endpoint: /success-otp
 # ─────────────────────────────────────────────────────────────
 def _fetch_p1_otps() -> list:
     try:
@@ -375,7 +358,7 @@ def _global_p1_poller():
     print(f"[P1-POLLER] শুরু। pre-seen={len(seen)}")
 
     while True:
-        time.sleep(1)          # ← 1 সেকেন্ড interval
+        time.sleep(1)
         try:
             with _p1_reg_lock:
                 if not _p1_registry:
@@ -443,7 +426,7 @@ def _build_wa_client(chat_id: int) -> NewClient:
         try:
             bot.send_message(
                 chat_id,
-                "✅ *WhatsApp সংযুক্ত হয়েছে!*\n\nএখন নম্বর চেক করা যাবে।",
+                "✅ *WhatsApp সংযুক্ত হয়েছে!*\n\nএখন OLD নাম্বার চেক করা যাবে।",
                 reply_markup=_main_kb(chat_id),
             )
         except: pass
@@ -470,9 +453,6 @@ def _reconnect_silent(chat_id: int):
         wa_statuses[chat_id] = "disconnected"
         print(f"[WA] reconnect fail {chat_id}: {e}")
 
-# ─────────────────────────────────────────────────────────────
-#  PAIR PHONE  — neonize 0.4.x  — TESTED & CONFIRMED WORKING
-# ─────────────────────────────────────────────────────────────
 def connect_with_code(chat_id: int, phone: str):
     if get_wa_status(chat_id) == "connected":
         bot.send_message(chat_id, "✅ *WhatsApp ইতিমধ্যে সংযুক্ত!*",
@@ -505,7 +485,7 @@ def connect_with_code(chat_id: int, phone: str):
             wa_clients.pop(chat_id, None)
             bot.send_message(
                 chat_id,
-                f"❌ সংযোগ ব্যর্থ:\n`{e}`\n\nআবার *❌ WA Checker* চাপুন।",
+                f"❌ সংযোগ ব্যর্থ:\n`{e}`\n\nআবার *❌ WP Checker* চাপুন।",
                 reply_markup=_main_kb(chat_id),
                 parse_mode="Markdown",
             )
@@ -531,14 +511,13 @@ def _main_kb(chat_id=None):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.row(types.KeyboardButton("🔴 P1 Console"),
            types.KeyboardButton("🔵 P2 Console"))
-    kb.row(types.KeyboardButton("📞 P1 নাম্বার"),
-           types.KeyboardButton("📞 P2 নাম্বার"))
+    kb.add(types.KeyboardButton("📲 OLD নাম্বার"))
     kb.add(types.KeyboardButton("🔍 নাম্বার চেকার"))
     if st == "connected":
-        kb.row(types.KeyboardButton("✅ WA Checker"),
-               types.KeyboardButton("🔌 WA ডিসকানেক্ট"))
+        kb.row(types.KeyboardButton("✅ WP Checker"),
+               types.KeyboardButton("🔌 WP Disconnect"))
     else:
-        kb.add(types.KeyboardButton("❌ WA Checker"))
+        kb.add(types.KeyboardButton("❌ WP Checker"))
     return kb
 
 def _console_kb(panel: str):
@@ -547,30 +526,23 @@ def _console_kb(panel: str):
         "🔄 Refresh", callback_data=f"cr|{panel}"))
     return kb
 
-def _number_kb(numbers, wa_res, panel, range_id):
+def _old_number_kb(numbers: list, range_id: str):
     kb = types.InlineKeyboardMarkup(row_width=1)
+    all_text = "\n".join(n["full"] for n in numbers)
+    kb.add(types.InlineKeyboardButton(
+        f"📋 🗑 সব {len(numbers)}টি নাম্বার কপি করুন",
+        copy_text=types.CopyTextButton(text=all_text)))
     for n in numbers:
-        v    = wa_res.get(n["full"])
-        icon = "🔴" if v is True else ("🟢" if v is False else "⬜")
         kb.add(types.InlineKeyboardButton(
-            f"{icon}  {n['full']}",
+            f"📋 🔴 {n['full']}",
             copy_text=types.CopyTextButton(text=n["full"])))
     kb.row(
         types.InlineKeyboardButton(
-            "🔄 নাম্বার চেঞ্জ", callback_data=f"nb|{panel}|{range_id}"),
+            "🔃 আরো OLD নাম্বার", callback_data=f"old|{range_id}"),
         types.InlineKeyboardButton(
             "❌ বন্ধ", callback_data="cb"),
     )
     return kb
-
-def _card_header(range_id, panel, count, failed=0, service=""):
-    label    = "P1" if panel == "p1" else "P2"
-    svc_name = service or _resolve_service(range_id=range_id)
-    icon     = _svc_icon(svc_name)
-    h = f"{icon} *{svc_name.upper()}* [{label}]  —  {count}টি নাম্বার"
-    if failed: h += f"  _(⚠️ {failed} মিস)_"
-    h += "\n⏳ _OTP আসলে আপনার inbox-এ দেখাবে_"
-    return h
 
 # ─────────────────────────────────────────────────────────────
 #  CONSOLE
@@ -629,128 +601,22 @@ def _send_console(chat_id, panel, edit_id=None):
     bot.send_message(chat_id, text, reply_markup=kb, parse_mode="Markdown")
 
 # ─────────────────────────────────────────────────────────────
-#  FETCH NUMBERS  (6টা parallel — fast)
+#  FETCH ONE NUMBER  (P1 only)
 # ─────────────────────────────────────────────────────────────
-def _fetch_one(panel: str, range_id: str):
-    if panel == "p1":
-        resp    = p1_post("/getnum", {"range": range_id})
-        code    = resp.get("meta", {}).get("code")
-        data    = resp.get("data", {}) or {}
-        full    = str(data.get("full_number", ""))
-        plain   = str(data.get("no_plus_number") or full.lstrip("+"))
-        country = str(data.get("country") or "")
-        service = str(data.get("service") or data.get("sid") or "")
-        if full and code == 200:
-            return dict(full=full, plain=plain, country=country,
-                        service=service, rid=None,
-                        otp_now=False, otp_msg="")
-        return None
-
-    resp    = p2_post("/getnum", {"range": range_id})
-    data    = resp.get("data", resp) or {}
-    if not isinstance(data, dict): data = {}
-
-    full    = (data.get("full_number") or data.get("number")
-               or resp.get("full_number") or resp.get("number") or "")
-    plain   = str(data.get("no_plus_number") or str(full).lstrip("+"))
-    country = str(data.get("country") or resp.get("country") or "")
-    service = str(data.get("service") or data.get("sid")
-                  or resp.get("service") or resp.get("sid") or "")
-    rid     = str(resp.get("rid") or data.get("rid") or "")
-    otp_now = bool(data.get("otp_now") or resp.get("otp_now"))
-    otp_msg = str(data.get("otp_message") or data.get("message")
-                  or resp.get("otp_message") or resp.get("message") or "")
-
-    print(f"[P2-FETCH] full={full} rid={rid} otp_now={otp_now}")
-
-    if full:
-        return dict(full=full, plain=plain, country=country,
-                    service=service, rid=rid,
-                    otp_now=otp_now, otp_msg=otp_msg)
+def _fetch_one(range_id: str):
+    resp    = p1_post("/getnum", {"range": range_id})
+    code    = resp.get("meta", {}).get("code")
+    data    = resp.get("data", {}) or {}
+    full    = str(data.get("full_number", ""))
+    plain   = str(data.get("no_plus_number") or full.lstrip("+"))
+    country = str(data.get("country") or "")
+    service = str(data.get("service") or data.get("sid") or "")
+    if full and code == 200:
+        return dict(full=full, plain=plain, country=country, service=service)
     return None
 
-def get_6_numbers(chat_id, panel, range_id, edit_msg_id=None):
-    label   = "P1" if panel == "p1" else "P2"
-    loading = f"⏳ `{range_id}` [{label}] থেকে নাম্বার আনা হচ্ছে..."
-
-    if edit_msg_id:
-        edit_safe(chat_id, edit_msg_id, loading)
-        st_id = edit_msg_id
-    else:
-        st    = bot.send_message(chat_id, loading, parse_mode="Markdown")
-        st_id = st.message_id
-
-    results, failed = [], 0
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        futs = [ex.submit(_fetch_one, panel, range_id) for _ in range(6)]
-        for f in as_completed(futs):
-            info = f.result()
-            if info: results.append(info)
-            else:    failed += 1
-
-    if not results:
-        err = (f"❌ `{range_id}` [{label}] থেকে নাম্বার পাওয়া যায়নি।\n"
-               "_রেঞ্জ খালি বা API error।_")
-        if edit_msg_id: edit_safe(chat_id, st_id, err)
-        else:
-            safe_delete(chat_id, st_id)
-            bot.send_message(chat_id, err, parse_mode="Markdown")
-        return
-
-    batch_svc = results[0].get("service","") if results else ""
-    wa_res    = _wa_bulk(chat_id, results)
-    header    = _card_header(range_id, panel, len(results),
-                              failed, service=batch_svc)
-    kb        = _number_kb(results, wa_res, panel, range_id)
-
-    if edit_msg_id:
-        try:
-            bot.edit_message_text(header, chat_id, st_id,
-                                  reply_markup=kb, parse_mode="Markdown")
-        except:
-            bot.send_message(chat_id, header,
-                             reply_markup=kb, parse_mode="Markdown")
-    else:
-        safe_delete(chat_id, st_id)
-        bot.send_message(chat_id, header,
-                         reply_markup=kb, parse_mode="Markdown")
-
-    # active_watches update (cleanup reference)
-    plains = {n["plain"].lstrip("+") for n in results}
-    with watch_lock:
-        existing = active_watches.get(chat_id, set())
-        active_watches[chat_id] = existing | plains
-
-    def _cleanup():
-        time.sleep(605)
-        with watch_lock:
-            cur = active_watches.get(chat_id, set())
-            active_watches[chat_id] = cur - plains
-    threading.Thread(target=_cleanup, daemon=True).start()
-
-    # ── Global registry-তে register করো ────────────────────────
-    _register_numbers(panel, results, range_id, chat_id, duration=600)
-
-    # P2: otp_now=True হলে সাথে সাথে notify করো
-    if panel == "p2":
-        for n in results:
-            if n.get("otp_now") and n.get("otp_msg"):
-                code = extract_otp(n["otp_msg"])
-                if code and code != "???":
-                    _notify_otp(
-                        chat_id,
-                        full_num=n["full"],
-                        otp_code=code,
-                        country=n.get("country",""),
-                        service=n.get("service",""),
-                        range_id=range_id,
-                    )
-                    # registry থেকে সরাও (ইতিমধ্যে deliver হয়ে গেছে)
-                    with _p2_reg_lock:
-                        _p2_registry.pop(n["plain"].lstrip("+"), None)
-
 # ─────────────────────────────────────────────────────────────
-#  WA CHECK
+#  WA BULK CHECK
 # ─────────────────────────────────────────────────────────────
 def _wa_bulk(chat_id, numbers):
     result = {n["full"]: None for n in numbers}
@@ -792,14 +658,91 @@ def _wa_check(chat_id, numbers):
     return result
 
 # ─────────────────────────────────────────────────────────────
+#  GET OLD NUMBERS  — P1 → 30 parallel → WA check → 5টা WA নাম্বার
+# ─────────────────────────────────────────────────────────────
+def get_old_numbers(cid, range_id, edit_msg_id=None):
+    BATCH      = 20   # প্রতি রাউন্ডে কতটা fetch
+    MAX_ROUNDS = 8    # সর্বোচ্চ কত রাউন্ড
+    TARGET     = 5    # কতটা WA নাম্বার চাই
+
+    def _prog(found_n, rnd):
+        return (f"⏳ `{range_id}` P1 খোঁজা হচ্ছে...\n"
+                f"✅ পাওয়া গেছে: {found_n}/5 (রাউন্ড {rnd})")
+
+    if edit_msg_id:
+        edit_safe(cid, edit_msg_id, _prog(0, 1))
+        st_id = edit_msg_id
+    else:
+        st    = bot.send_message(cid, _prog(0, 1), parse_mode="Markdown")
+        st_id = st.message_id
+
+    found      = []
+    seen_full  = set()
+    total_fail = 0
+
+    for rnd in range(1, MAX_ROUNDS + 1):
+        # ── প্রতি রাউন্ডে BATCH টা নাম্বার parallel fetch ──
+        batch = []
+        with ThreadPoolExecutor(max_workers=BATCH) as ex:
+            futs = [ex.submit(_fetch_one, range_id) for _ in range(BATCH)]
+            for f in as_completed(futs):
+                r = f.result()
+                if r and r["full"] not in seen_full:
+                    seen_full.add(r["full"])
+                    batch.append(r)
+
+        if not batch:
+            total_fail += 1
+            if total_fail >= 3:           # ৩ রাউন্ড ধরে কিছু নেই → দাও
+                break
+            edit_safe(cid, st_id, _prog(len(found), rnd))
+            continue
+        total_fail = 0
+
+        # ── WA bulk check ──
+        wa_res   = _wa_bulk(cid, batch)
+        new_wa   = [n for n in batch if wa_res.get(n["full"]) is True]
+        found.extend(new_wa)
+
+        edit_safe(cid, st_id, _prog(len(found), rnd))
+
+        if len(found) >= TARGET:
+            break
+
+    found = found[:TARGET]
+
+    if not found:
+        err = (f"❌ `{range_id}` — {MAX_ROUNDS} রাউন্ড চেক করলাম, WA নাম্বার পাওয়া যায়নি।\n"
+               f"_(রেঞ্জ বদলে আবার চেষ্টা করুন)_")
+        if edit_msg_id: edit_safe(cid, st_id, err)
+        else:
+            safe_delete(cid, st_id)
+            bot.send_message(cid, err, parse_mode="Markdown")
+        return
+
+    header = (f"🤝 *WHATSAPP P1 — OLD নাম্বার*\n"
+              f"🔴 *{len(found)}টি WhatsApp নাম্বার পাওয়া গেছে*\n"
+              f"OTP আসলে inbox-এ দেখাবে")
+    kb = _old_number_kb(found, range_id)
+
+    if edit_msg_id:
+        try: bot.edit_message_text(header, cid, st_id, reply_markup=kb, parse_mode="Markdown")
+        except: bot.send_message(cid, header, reply_markup=kb, parse_mode="Markdown")
+    else:
+        safe_delete(cid, st_id)
+        bot.send_message(cid, header, reply_markup=kb, parse_mode="Markdown")
+
+    _register("p1", found, range_id, cid, dur=600)
+
+# ─────────────────────────────────────────────────────────────
 #  BUTTON LABELS
 # ─────────────────────────────────────────────────────────────
 _ALL_BTN = {
     "🔴 P1 Console","🔵 P2 Console",
-    "📞 P1 নাম্বার","📞 P2 নাম্বার",
+    "📲 OLD নাম্বার",
     "🔍 নাম্বার চেকার",
-    "✅ WA Checker","❌ WA Checker",
-    "🔌 WA ডিসকানেক্ট",
+    "✅ WP Checker","❌ WP Checker",
+    "🔌 WP Disconnect",
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -808,76 +751,52 @@ _ALL_BTN = {
 @bot.message_handler(commands=["start"])
 def cmd_start(msg):
     _save_user(msg)
-    bot.send_message(
-        msg.chat.id,
-        "🤖 *OTP Panel Bot v5*\n\n"
-        "🔴 P1 / 🔵 P2 Console — লাইভ ট্র্যাফিক\n"
-        "📞 P1 / 📞 P2 নাম্বার — রেঞ্জ → ৬টি নাম্বার\n"
-        "🔍 নাম্বার চেকার — WhatsApp check\n"
-        "❌ WA Checker — Phone code দিয়ে লগইন (QR নেই)\n"
-        "🔌 WA ডিসকানেক্ট — সংযোগ বন্ধ\n\n"
+    bot.send_message(msg.chat.id,
+        "🤖 *OTP Panel Bot v6.0*\n\n"
+        "🔴 *P1 Console* — WealthoraPrime লাইভ ট্র্যাফিক\n"
+        "🔵 *P2 Console* — FastXOTPs লাইভ ট্র্যাফিক\n"
+        "📲 *OLD নাম্বার* — P1 থেকে শুধু WA আছে এমন ৫টি নাম্বার\n"
+        "🔍 *নাম্বার চেকার* — WhatsApp আছে কিনা চেক করুন\n"
+        "❌ *WP Checker* — WhatsApp লগইন (Phone code)\n"
+        "🔌 *WP Disconnect* — সংযোগ বন্ধ\n\n"
         "⚡ OTP আসামাত্র ≤১ সেকেন্ডে পাবেন",
-        reply_markup=_main_kb(msg.chat.id),
-    )
+        reply_markup=_main_kb(msg.chat.id))
 
 # ─────────────────────────────────────────────────────────────
-#  /stats  (admin only)
+#  /stats  /status  (admin)
 # ─────────────────────────────────────────────────────────────
 @bot.message_handler(commands=["stats"])
 def cmd_stats(msg):
     if msg.chat.id != ADMIN_ID: return
-    if not otp_stats:
-        bot.send_message(msg.chat.id, "📊 এখনো কোনো OTP রিসিভ হয়নি।")
-        return
+    if not otp_stats: bot.send_message(msg.chat.id, "📊 এখনো কোনো OTP নেই।"); return
     text  = "📊 *OTP Statistics*\n━━━━━━━━━━━━━━━━━\n"
     total = 0
     for uid, cnt in sorted(otp_stats.items(), key=lambda x: -x[1]):
-        with names_lock:
-            uname = user_names.get(uid, "")
-        if uname.startswith("@"):
-            link = f"[{uname}](tg://user?id={uid})"
-        else:
-            link = f"[{uname or uid}](tg://user?id={uid})"
-        text  += f"👤 {link} — *{cnt}* OTP\n"
-        total += cnt
-    text += f"━━━━━━━━━━━━━━━━━\n📋 মোট: *{total}* OTP"
-    bot.send_message(msg.chat.id, text, parse_mode="Markdown",
-                     disable_web_page_preview=True)
+        lbl = _get_label(uid)
+        lnk = f"[{lbl}](tg://user?id={uid})"
+        text += f"👤 {lnk} — *{cnt}* OTP\n"; total += cnt
+    text += f"━━━━━━━━━━━━━━━━━\n📋 মোট: *{total}*"
+    bot.send_message(msg.chat.id, text, parse_mode="Markdown", disable_web_page_preview=True)
 
-# ─────────────────────────────────────────────────────────────
-#  /status  (admin only)
-# ─────────────────────────────────────────────────────────────
 @bot.message_handler(commands=["status"])
 def cmd_status(msg):
     if msg.chat.id != ADMIN_ID: return
-    connected  = [cid for cid, st in wa_statuses.items() if st == "connected"]
-    connecting = [cid for cid, st in wa_statuses.items() if st == "connecting"]
-    with watch_lock:
-        watching = sum(len(v) for v in active_watches.values())
-    with _p2_reg_lock:
-        p2_active = len(_p2_registry)
-    with _p1_reg_lock:
-        p1_active = len(_p1_registry)
-    total_otp = sum(otp_stats.values()) if otp_stats else 0
-    text = (
-        "🖥 *Bot Status  v5*\n━━━━━━━━━━━━━━━━━\n"
-        f"⏱ Uptime: `{uptime_str()}`\n"
-        f"👥 WA Connected: `{len(connected)}`\n"
-        f"🔄 WA Connecting: `{len(connecting)}`\n"
-        f"👁 Active watches: `{watching}`\n"
-        f"🔵 P2 watching: `{p2_active}` নম্বর\n"
-        f"🔴 P1 watching: `{p1_active}` নম্বর\n"
-        f"📨 Total OTPs: `{total_otp}`\n"
-        f"━━━━━━━━━━━━━━━━━\n"
-    )
+    connected  = [c for c,s in wa_statuses.items() if s=="connected"]
+    connecting = [c for c,s in wa_statuses.items() if s=="connecting"]
+    with _p1_reg_lock: p1w = len(_p1_registry)
+    with _p2_reg_lock: p2w = len(_p2_registry)
+    text = (f"🖥 *Bot Status v6.0*\n━━━━━━━━━━━━━━━━━\n"
+            f"⏱ Uptime: `{uptime_str()}`\n"
+            f"👥 WA Connected: `{len(connected)}`\n"
+            f"🔄 WA Connecting: `{len(connecting)}`\n"
+            f"🔴 P1 watching: `{p1w}` নাম্বার\n"
+            f"🔵 P2 watching: `{p2w}` নাম্বার\n"
+            f"📨 Total OTPs: `{sum(otp_stats.values())}`\n━━━━━━━━━━━━━━━━━\n")
     if connected:
-        text += "*Connected users:*\n"
+        text += "*Connected:*\n"
         for cid in connected:
-            cnt   = otp_stats.get(cid, 0)
-            label = _get_label(cid)
-            text += f"  • `{cid}` ({label}) — {cnt} OTP\n"
-    bot.send_message(msg.chat.id, text, parse_mode="Markdown",
-                     disable_web_page_preview=True)
+            text += f"  • `{cid}` ({_get_label(cid)}) — {otp_stats.get(cid,0)} OTP\n"
+    bot.send_message(msg.chat.id, text, parse_mode="Markdown", disable_web_page_preview=True)
 
 # ─────────────────────────────────────────────────────────────
 #  CONSOLE BUTTONS
@@ -885,201 +804,138 @@ def cmd_status(msg):
 @bot.message_handler(func=lambda m: m.text == "🔴 P1 Console")
 def btn_p1_console(msg):
     _save_user(msg)
-    threading.Thread(target=_send_console,
-                     args=(msg.chat.id,"p1"), daemon=True).start()
+    threading.Thread(target=_send_console, args=(msg.chat.id,"p1"), daemon=True).start()
 
 @bot.message_handler(func=lambda m: m.text == "🔵 P2 Console")
 def btn_p2_console(msg):
     _save_user(msg)
-    threading.Thread(target=_send_console,
-                     args=(msg.chat.id,"p2"), daemon=True).start()
+    threading.Thread(target=_send_console, args=(msg.chat.id,"p2"), daemon=True).start()
 
 # ─────────────────────────────────────────────────────────────
-#  NUMBER BUTTONS
+#  📲 OLD নাম্বার — সরাসরি range চাও (P1 only)
 # ─────────────────────────────────────────────────────────────
-@bot.message_handler(func=lambda m: m.text == "📞 P1 নাম্বার")
-def btn_p1_num(msg):
+@bot.message_handler(func=lambda m: m.text == "📲 OLD নাম্বার")
+def btn_old(msg):
     _save_user(msg)
-    with state_lock:
-        user_state[msg.chat.id] = {"mode": "wait_range_p1"}
-    bot.send_message(msg.chat.id,
-                     "📝 *P1* রেঞ্জ লিখুন  (যেমন: `22501XXX`)",
-                     parse_mode="Markdown")
-
-@bot.message_handler(func=lambda m: m.text == "📞 P2 নাম্বার")
-def btn_p2_num(msg):
-    _save_user(msg)
-    with state_lock:
-        user_state[msg.chat.id] = {"mode": "wait_range_p2"}
-    bot.send_message(msg.chat.id,
-                     "📝 *P2* রেঞ্জ লিখুন  (যেমন: `26134XXX`)",
-                     parse_mode="Markdown")
+    cid = msg.chat.id
+    if get_wa_status(cid) != "connected":
+        bot.send_message(cid,
+            "❌ *OLD নাম্বার পেতে WhatsApp সংযুক্ত থাকতে হবে।*\n\n"
+            "প্রথমে *❌ WP Checker* দিয়ে লগইন করুন।",
+            reply_markup=_main_kb(cid), parse_mode="Markdown")
+        return
+    with state_lock: user_state[cid] = {"mode": "wait_range_old"}
+    bot.send_message(cid,
+        "📲 *OLD নাম্বার* — রেঞ্জ লিখুন\n"
+        "_(যেমন: `22501XXX`)_\n\n"
+        "_P1 থেকে ৩০টা করে WA চেক করে ৫টা পুরনো নাম্বার দেবে_",
+        parse_mode="Markdown")
 
 # ─────────────────────────────────────────────────────────────
-#  ❌ / ✅ WA CHECKER BUTTON
+#  WP CHECKER
 # ─────────────────────────────────────────────────────────────
-@bot.message_handler(
-    func=lambda m: m.text in ("✅ WA Checker", "❌ WA Checker"))
+@bot.message_handler(func=lambda m: m.text in ("✅ WP Checker","❌ WP Checker"))
 def btn_wa(msg):
     _save_user(msg)
-    chat_id = msg.chat.id
-    status  = get_wa_status(chat_id)
-    if status == "connected":
-        bot.send_message(chat_id, "✅ *WhatsApp ইতিমধ্যে সংযুক্ত!*",
-                         reply_markup=_main_kb(chat_id))
+    cid = msg.chat.id
+    st  = get_wa_status(cid)
+    if st == "connected":
+        bot.send_message(cid, "✅ *WhatsApp ইতিমধ্যে সংযুক্ত!*", reply_markup=_main_kb(cid))
         return
-    if status == "connecting":
-        bot.send_message(chat_id, "⏳ কোড তৈরি হচ্ছে, একটু অপেক্ষা করুন...")
+    if st == "connecting":
+        bot.send_message(cid, "⏳ *কোড তৈরি হচ্ছে...* একটু অপেক্ষা করুন।", parse_mode="Markdown")
         return
-    with state_lock:
-        user_state[chat_id] = {"mode": "wait_phone"}
-    bot.send_message(
-        chat_id,
-        "📱 *WhatsApp নম্বর* দিন (দেশের কোড সহ)\n\n"
-        "উদাহরণ: `+8801712345678`",
-        parse_mode="Markdown",
-    )
+    with state_lock: user_state[cid] = {"mode": "wait_phone"}
+    bot.send_message(cid,
+        "📱 *WhatsApp নম্বর দিন* (দেশের কোড সহ)\n\nযেমন: `+8801712345678`",
+        parse_mode="Markdown")
 
 # ─────────────────────────────────────────────────────────────
-#  🔌 DISCONNECT BUTTON
+#  WP DISCONNECT
 # ─────────────────────────────────────────────────────────────
-@bot.message_handler(func=lambda m: m.text == "🔌 WA ডিসকানেক্ট")
+@bot.message_handler(func=lambda m: m.text == "🔌 WP Disconnect")
 def btn_disconnect(msg):
     _save_user(msg)
-    threading.Thread(target=disconnect_wa,
-                     args=(msg.chat.id,), daemon=True).start()
+    threading.Thread(target=disconnect_wa, args=(msg.chat.id,), daemon=True).start()
 
 # ─────────────────────────────────────────────────────────────
-#  🔍 NUMBER CHECKER
+#  নাম্বার চেকার
 # ─────────────────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: m.text == "🔍 নাম্বার চেকার")
 def btn_checker(msg):
     _save_user(msg)
-    chat_id = msg.chat.id
-    if get_wa_status(chat_id) != "connected":
-        bot.send_message(chat_id,
-                         "❌ *WhatsApp সংযুক্ত নেই।*\n\n"
-                         "প্রথমে *❌ WA Checker* চাপুন।",
-                         reply_markup=_main_kb(chat_id))
+    cid = msg.chat.id
+    if get_wa_status(cid) != "connected":
+        bot.send_message(cid, "❌ *WhatsApp সংযুক্ত নেই।*\n\nপ্রথমে *❌ WP Checker* চাপুন।",
+                         reply_markup=_main_kb(cid))
         return
-    with state_lock:
-        user_state[chat_id] = {"mode": "wait_check_numbers"}
-    bot.send_message(chat_id,
-                     "🔍 *নাম্বার চেকার*\n\n"
-                     "📞 নাম্বার পাঠান (প্রতি লাইনে একটি, সর্বোচ্চ ২০টি):",
-                     parse_mode="Markdown")
+    with state_lock: user_state[cid] = {"mode": "wait_check"}
+    bot.send_message(cid,
+        "🔍 *নাম্বার চেকার*\n\n📞 নাম্বার পাঠান (প্রতি লাইনে একটি, সর্বোচ্চ ২০টি):",
+        parse_mode="Markdown")
 
 # ─────────────────────────────────────────────────────────────
-#  FREE TEXT
+#  FREE TEXT HANDLER
 # ─────────────────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: True, content_types=["text"])
 def on_text(msg):
     _save_user(msg)
-    chat_id = msg.chat.id
-    text    = msg.text.strip()
+    cid  = msg.chat.id
+    text = msg.text.strip()
     if text.startswith("/") or text in _ALL_BTN: return
+    with state_lock: mode = user_state.get(cid, {}).get("mode","idle")
 
-    with state_lock:
-        mode = user_state.get(chat_id, {}).get("mode", "idle")
-
-    # ── wait_phone ──────────────────────────────────────────────
     if mode == "wait_phone":
-        with state_lock:
-            user_state[chat_id] = {"mode": "idle"}
-        phone = text.replace(" ", "").replace("-", "")
-        if not phone.startswith("+"):
-            phone = "+" + phone
+        with state_lock: user_state[cid] = {"mode":"idle"}
+        phone = text.replace(" ","").replace("-","")
+        if not phone.startswith("+"): phone = "+" + phone
         if not re.match(r"^\+\d{7,15}$", phone):
-            bot.send_message(
-                chat_id,
-                "❌ *নম্বর সঠিক নয়।*\n\nদেশের কোড সহ দিন।\nউদাহরণ: `+8801712345678`",
-                parse_mode="Markdown",
-            )
-            return
-        bot.send_message(chat_id,
-                         f"⏳ `{phone}` এর জন্য pairing code তৈরি হচ্ছে...",
-                         parse_mode="Markdown")
-        threading.Thread(
-            target=connect_with_code, args=(chat_id, phone), daemon=True
-        ).start()
+            bot.send_message(cid,
+                "❌ *নম্বর সঠিক নয়।*\n\nদেশের কোড সহ দিন।\nযেমন: `+8801712345678`",
+                parse_mode="Markdown"); return
+        bot.send_message(cid, f"⏳ `{phone}` এর pairing code তৈরি হচ্ছে...", parse_mode="Markdown")
+        threading.Thread(target=connect_with_code, args=(cid,phone), daemon=True).start()
 
-    # ── wait_range_p1 ───────────────────────────────────────────
-    elif mode == "wait_range_p1":
-        with state_lock:
-            user_state[chat_id] = {"mode": "idle"}
-        threading.Thread(
-            target=get_6_numbers, args=(chat_id, "p1", text), daemon=True
-        ).start()
+    elif mode == "wait_range_old":
+        with state_lock: user_state[cid] = {"mode":"idle"}
+        threading.Thread(target=get_old_numbers, args=(cid,text), daemon=True).start()
 
-    # ── wait_range_p2 ───────────────────────────────────────────
-    elif mode == "wait_range_p2":
-        with state_lock:
-            user_state[chat_id] = {"mode": "idle"}
-        threading.Thread(
-            target=get_6_numbers, args=(chat_id, "p2", text), daemon=True
-        ).start()
-
-    # ── wait_check_numbers ──────────────────────────────────────
-    elif mode == "wait_check_numbers":
-        with state_lock:
-            user_state[chat_id] = {"mode": "idle"}
+    elif mode == "wait_check":
+        with state_lock: user_state[cid] = {"mode":"idle"}
         lines = [l.strip() for l in text.splitlines() if l.strip()][:20]
-        if not lines:
-            bot.send_message(chat_id, "❌ কোনো নাম্বার পাওয়া যায়নি।")
-            return
-        loading = bot.send_message(
-            chat_id, f"⏳ {len(lines)}টি নাম্বার চেক হচ্ছে...", parse_mode="Markdown"
-        )
-        def _do_check():
-            results = _wa_check(chat_id, lines)
-            out = []
-            for n, is_on in results.items():
-                if is_on is True:   icon = "🔴 WhatsApp আছে"
-                elif is_on is False: icon = "🟢 WhatsApp নেই"
-                else:               icon = "⬜ চেক হয়নি"
-                out.append(f"`{n}` — {icon}")
-            safe_delete(chat_id, loading.message_id)
-            bot.send_message(
-                chat_id,
-                "🔍 *নাম্বার চেকার ফলাফল:*\n\n" + "\n".join(out),
-                parse_mode="Markdown",
-            )
-        threading.Thread(target=_do_check, daemon=True).start()
+        if not lines: bot.send_message(cid, "❌ কোনো নাম্বার পাওয়া যায়নি।"); return
+        loading = bot.send_message(cid, f"⏳ {len(lines)}টি নাম্বার চেক হচ্ছে...", parse_mode="Markdown")
+        def _do():
+            res = _wa_check(cid, lines)
+            wa, no_wa, unk = [], [], []
+            for n, v in res.items():
+                if v is True:  wa.append(f"🔴 `{n}` — WA আছে")
+                elif v is False: no_wa.append(f"🟢 `{n}` — WA নেই")
+                else: unk.append(f"⬜ `{n}` — চেক হয়নি")
+            safe_delete(cid, loading.message_id)
+            bot.send_message(cid, "🔍 *ফলাফল:*\n\n" + "\n".join(wa+no_wa+unk), parse_mode="Markdown")
+        threading.Thread(target=_do, daemon=True).start()
 
 # ─────────────────────────────────────────────────────────────
-#  CALLBACK QUERY HANDLER
+#  CALLBACK HANDLER
 # ─────────────────────────────────────────────────────────────
 @bot.callback_query_handler(func=lambda c: True)
 def on_callback(call):
     _save_user(call.from_user)
-    data    = call.data
-    chat_id = call.message.chat.id
-    msg_id  = call.message.message_id
+    data = call.data; cid = call.message.chat.id; mid = call.message.message_id
 
     if data == "cb":
-        safe_delete(chat_id, msg_id)
-        bot.answer_callback_query(call.id)
-        return
+        safe_delete(cid, mid); bot.answer_callback_query(call.id); return
 
     if data.startswith("cr|"):
         panel = data.split("|")[1]
         bot.answer_callback_query(call.id, "🔄 Refreshing...")
-        threading.Thread(
-            target=_send_console, args=(chat_id, panel, msg_id), daemon=True
-        ).start()
-        return
+        threading.Thread(target=_send_console, args=(cid,panel,mid), daemon=True).start(); return
 
-    if data.startswith("nb|"):
-        parts    = data.split("|", 2)
-        panel    = parts[1]
-        range_id = parts[2]
-        bot.answer_callback_query(call.id, "🔄 নতুন নাম্বার আনা হচ্ছে...")
-        threading.Thread(
-            target=get_6_numbers,
-            args=(chat_id, panel, range_id, msg_id),
-            daemon=True,
-        ).start()
-        return
+    if data.startswith("old|"):
+        range_id = data.split("|",1)[1]
+        bot.answer_callback_query(call.id, "🔴 OLD নাম্বার খোঁজা হচ্ছে...")
+        threading.Thread(target=get_old_numbers, args=(cid,range_id,mid), daemon=True).start(); return
 
     bot.answer_callback_query(call.id)
 
@@ -1087,12 +943,7 @@ def on_callback(call):
 #  MAIN
 # ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print(f"🤖 OTP Panel Bot v5.0 চালু হচ্ছে... (admin={ADMIN_ID})")
-
-    # Global pollers — daemon thread, একটাই প্রতিটার জন্য
-    threading.Thread(target=_global_p2_poller, daemon=True,
-                     name="P2-GlobalPoller").start()
-    threading.Thread(target=_global_p1_poller, daemon=True,
-                     name="P1-GlobalPoller").start()
-
+    print(f"🤖 OTP Panel Bot v6.0 চালু হচ্ছে... (admin={ADMIN_ID})")
+    threading.Thread(target=_global_p1_poller, daemon=True, name="P1-Poller").start()
+    threading.Thread(target=_global_p2_poller, daemon=True, name="P2-Poller").start()
     bot.infinity_polling(timeout=30, long_polling_timeout=20)
