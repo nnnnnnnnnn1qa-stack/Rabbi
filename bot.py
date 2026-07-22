@@ -1,3 +1,4 @@
+"""
 OTP Panel Bot v6.0 — SUPER FAST & CLEAN
 =========================================================
 বাটন:
@@ -241,7 +242,7 @@ def _notify_otp(chat_id, full_num, otp_code, country="", service="", range_id=""
 # ─────────────────────────────────────────────────────────────
 #  GLOBAL P1 POLLER — 1s interval
 # ─────────────────────────────────────────────────────────────
-def _fetch_p1_otps():
+def _htps():
     try:
         resp = p1_get("/success-otp")
         otps = (resp.get("data") or {}).get("otps", [])
