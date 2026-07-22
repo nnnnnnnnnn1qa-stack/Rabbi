@@ -224,3 +224,4 @@ if __name__ == "__main__":
     threading.Thread(target=_global_p1_poller, daemon=True, name="P1-Poller").start()
     threading.Thread(target=_global_p2_poller, daemon=True, name="P2-Poller").start()
     bot.infinity_polling(timeout=30, long_polling_timeout=20)
+
