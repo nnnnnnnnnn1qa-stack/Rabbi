@@ -1,949 +1,507 @@
 """
-OTP Panel Bot v6.0 — ULTRA FAST
-=========================================================
-P1  : WealthoraPrime    → OLD নাম্বার + Console (1s global poll)
-P2  : FastXOTPs        → Console only            (1s global poll)
-WA  : neonize – PairPhone code (no QR), per-user session
-Admin : ADMIN_ID → /stats  /status
-=========================================================
-✅  Global P2 poller  — 1 টা thread, সব user-এর জন্য, 1s interval
-✅  Global P1 poller  — 1 টা thread, সব user-এর জন্য, 1s interval
-✅  OLD নাম্বার — 30টা parallel fetch → WA check → 5টা WA নাম্বার
-✅  OTP panel-এ আসার ≤1s এ user পায়
-✅  WA Checker unchanged (working)
+Telegram OTP Sender Bot — single file version.
+
+Setup:
+  pip install pyrogram tgcrypto python-telegram-bot
+
+Env vars:
+  TELEGRAM_BOT_TOKEN   — BotFather token
+  TELEGRAM_API_ID      — my.telegram.org API ID
+  TELEGRAM_API_HASH    — my.telegram.org API hash
+  TELEGRAM_ADMIN_ID    — your Telegram user ID (only this user can control the bot)
 """
 
+import asyncio
+import logging
 import os
 import re
+import sys
 import time
-import threading
-import logging
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Optional
 
-import telebot
-from telebot import types
-from neonize.client import NewClient
-from neonize.events import ConnectedEv, DisconnectedEv
-
-# ─────────────────────────────────────────────────────────────
-#  CONFIG
-# ─────────────────────────────────────────────────────────────
-BOT_TOKEN = (
-    os.environ.get("WA_CHECKER_BOT_TOKEN")
-    or os.environ.get("TELEGRAM_BOT_TOKEN", "")
+from pyrogram import Client
+from pyrogram.errors import FloodWait
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
 )
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "8523774444"))
 
-P1_BASE = os.environ.get(
-    "WEALTHORA_API_BASE",
-    "https://api.2oo9.cloud/MXS47FLFX0U/tnevs/@public/api",
+# ─────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.INFO,
 )
-P1_KEY  = os.environ.get("WEALTHORA_API_KEY", "MWFG9WNAHZQ")
-P1_HDRS = {"mauthapi": P1_KEY}
 
-P2_BASE = os.environ.get("FASTXOTPS_API_BASE", "https://fastxotps.com")
-P2_KEY  = os.environ.get("FASTXOTPS_API_KEY", "MURAD_69548E938AF8F1D4E0587220")
-P2_HDRS = {"X-API-Key": P2_KEY, "Content-Type": "application/json"}
+_pylog = logging.getLogger("otp_bot")
 
-if not BOT_TOKEN:
-    raise SystemExit("❌  TELEGRAM_BOT_TOKEN env var is required.")
 
-logging.basicConfig(level=logging.WARNING)
-logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown",
-                      num_threads=80)
+class AppLogger:
+    def __init__(self, maxlen: int = 300):
+        self._all: deque = deque(maxlen=maxlen)
+        self._success: deque = deque(maxlen=maxlen)
+        self._failed: deque = deque(maxlen=maxlen)
 
-# ─────────────────────────────────────────────────────────────
-#  HTTP SESSIONS
-# ─────────────────────────────────────────────────────────────
-def _make_session(pool_conn=50, pool_max=100, retries=2,
-                  force_list=(502, 503, 504)) -> requests.Session:
-    s = requests.Session()
-    retry = Retry(total=retries, backoff_factor=0.2,
-                  status_forcelist=list(force_list))
-    adapter = HTTPAdapter(pool_connections=pool_conn,
-                          pool_maxsize=pool_max,
-                          max_retries=retry)
-    s.mount("http://",  adapter)
-    s.mount("https://", adapter)
-    return s
+    @staticmethod
+    def _ts() -> str:
+        return datetime.now().strftime("%H:%M:%S")
 
-_session  = _make_session(pool_conn=50, pool_max=100)
-_p2_sess  = _make_session(pool_conn=10, pool_max=20,
-                           retries=0, force_list=())
+    def _append(self, line: str) -> None:
+        self._all.appendleft(line)
 
-def _get(url, params=None, headers=None, timeout=8):
+    def info(self, msg: str) -> None:
+        _pylog.info(msg)
+        self._append(f"[{self._ts()}] INFO  {msg}")
+
+    def warning(self, msg: str) -> None:
+        _pylog.warning(msg)
+        self._append(f"[{self._ts()}] WARN  {msg}")
+
+    def error(self, msg: str) -> None:
+        _pylog.error(msg)
+        self._append(f"[{self._ts()}] ERROR {msg}")
+
+    def log_success(self, phone: str, msg: str) -> None:
+        line = f"[{self._ts()}] ✅ {phone} — {msg}"
+        self._success.appendleft(line)
+        self._append(line)
+
+    def log_failed(self, phone: str, msg: str) -> None:
+        line = f"[{self._ts()}] ❌ {phone} — {msg}"
+        self._failed.appendleft(line)
+        self._append(line)
+
+    def get_all_logs(self, n: int = 30) -> str:
+        return "\n".join(list(self._all)[:n])
+
+    def get_success_logs(self, n: int = 20) -> str:
+        return "\n".join(list(self._success)[:n])
+
+    def get_failed_logs(self, n: int = 20) -> str:
+        return "\n".join(list(self._failed)[:n])
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────
+
+def parse_phone_list(text: str) -> list:
+    phones, seen = [], set()
+    for raw in text.strip().splitlines():
+        cleaned = re.sub(r"[\s\-\(\)\.]+", "", raw.strip())
+        if re.match(r"^\+\d{7,15}$", cleaned) and cleaned not in seen:
+            phones.append(cleaned)
+            seen.add(cleaned)
+    return phones
+
+
+def format_duration(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m {s}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m {s}s"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# OTP Sender (Pyrogram)
+# ─────────────────────────────────────────────────────────────────────
+
+class ProcessStatus(Enum):
+    IDLE     = "idle"
+    RUNNING  = "running"
+    STOPPING = "stopping"
+    DONE     = "done"
+
+
+@dataclass
+class ProcessStats:
+    total:   int = 0
+    success: int = 0
+    failed:  int = 0
+    _start: float = field(default_factory=time.time)
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.total - self.success - self.failed)
+
+    @property
+    def progress_pct(self) -> float:
+        if self.total == 0:
+            return 0.0
+        return round((self.success + self.failed) / self.total * 100, 1)
+
+    @property
+    def elapsed(self) -> int:
+        return int(time.time() - self._start)
+
+
+API_ID   = int(os.environ.get("TELEGRAM_API_ID",   "0"))
+API_HASH = os.environ.get("TELEGRAM_API_HASH",  "")
+RECONNECT_EVERY = 5   # reconnect after every N numbers
+
+
+class TelegramOTPSender:
+    def __init__(self, log: AppLogger):
+        self._log = log
+        self._stats  = ProcessStats()
+        self._status = ProcessStatus.IDLE
+        self._should_stop = False
+        self._client: Optional[Client] = None
+
+    @property
+    def stats(self) -> ProcessStats:
+        return self._stats
+
+    @property
+    def status(self) -> ProcessStatus:
+        return self._status
+
+    def is_running(self) -> bool:
+        return self._status == ProcessStatus.RUNNING
+
+    def stop(self) -> None:
+        self._should_stop = True
+        self._status = ProcessStatus.STOPPING
+        self._log.info("🛑 Stop requested.")
+
+    def start(self, phones_text: str) -> bool:
+        phones = parse_phone_list(phones_text)
+        if not phones or self.is_running():
+            return False
+        self._stats = ProcessStats()
+        self._stats.total = len(phones)
+        self._should_stop = False
+        self._status = ProcessStatus.RUNNING
+        asyncio.create_task(self._run(phones))
+        return True
+
+    def _make_client(self) -> Client:
+        return Client(
+            name=":memory:",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            no_updates=True,
+        )
+
+    async def _reconnect(self) -> None:
+        self._log.info("🔄 Reconnecting (off → on)…")
+        if self._client is not None:
+            try:
+                await self._client.disconnect()
+            except Exception:
+                pass
+            self._client = None
+        await asyncio.sleep(0.2)
+        self._client = self._make_client()
+        await self._client.connect()
+        self._log.info("✅ Connected.")
+
+    async def _send_one(self, phone: str) -> None:
+        try:
+            await self._client.send_code(phone)
+            self._stats.success += 1
+            self._log.log_success(phone, "OTP sent ✓")
+        except FloodWait as e:
+            self._log.warning(f"FloodWait {e.value}s for {phone}, waiting…")
+            await asyncio.sleep(e.value + 1)
+            try:
+                await self._client.send_code(phone)
+                self._stats.success += 1
+                self._log.log_success(phone, "OTP sent ✓ (after flood wait)")
+            except Exception as e2:
+                self._stats.failed += 1
+                self._log.log_failed(phone, str(e2))
+        except Exception as e:
+            self._stats.failed += 1
+            self._log.log_failed(phone, str(e))
+
+    async def _run(self, phones: list) -> None:
+        try:
+            await self._reconnect()
+
+            for i, phone in enumerate(phones):
+                if self._should_stop:
+                    self._log.info("🛑 Stopped by user.")
+                    break
+
+                if i > 0 and i % RECONNECT_EVERY == 0:
+                    self._log.info(f"🔄 {i} done — reconnecting…")
+                    await self._reconnect()
+
+                await self._send_one(phone)
+                await asyncio.sleep(0.05)
+
+        except Exception as e:
+            self._log.error(f"Batch error: {e}")
+        finally:
+            if self._client is not None:
+                try:
+                    await self._client.disconnect()
+                except Exception:
+                    pass
+                self._client = None
+            self._status = ProcessStatus.DONE
+            s = self._stats
+            self._log.info(
+                f"✅ Done — sent:{s.success} failed:{s.failed} "
+                f"time:{format_duration(s.elapsed)}"
+            )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Telegram Bot (python-telegram-bot)
+# ─────────────────────────────────────────────────────────────────────
+
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+ADMIN_ID  = int(os.environ.get("TELEGRAM_ADMIN_ID", "0"))
+
+KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("📊 Stats"),       KeyboardButton("✅ Sent")],
+        [KeyboardButton("❌ Failed"),      KeyboardButton("📋 Logs")],
+        [KeyboardButton("🛑 Stop"),        KeyboardButton("🗑 Clear")],
+        [KeyboardButton("💻 Developer")],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+log     = AppLogger()
+tester  = TelegramOTPSender(log)
+
+
+async def _reply(update: Update, text: str) -> None:
+    await update.effective_message.reply_text(
+        text, parse_mode=ParseMode.MARKDOWN, reply_markup=KEYBOARD
+    )
+
+
+async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _reply(
+        update,
+        "📲 *OTP Sender*\n\n"
+        "ফোন নম্বর পেস্ট করুন (একটা করে প্রতি লাইনে):\n"
+        "`+8801711000001`\n"
+        "`+8801711000002`\n\n"
+        "🔄 প্রতি ব্যাচের আগে এবং প্রতি *৫টা* নম্বরের পরে *off→on*।",
+    )
+
+
+async def cmd_stats(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    s = tester.stats
+    await _reply(
+        update,
+        f"📊 *Statistics*\n\n"
+        f"▶️ Status:    `{tester.status.value}`\n"
+        f"📋 Total:     `{s.total}`\n"
+        f"✅ Success:   `{s.success}`\n"
+        f"❌ Failed:    `{s.failed}`\n"
+        f"⏳ Remaining: `{s.remaining}`\n"
+        f"📈 Progress:  `{s.progress_pct:.1f}%`\n"
+        f"⏱ Elapsed:   `{format_duration(s.elapsed)}`",
+    )
+
+
+async def cmd_success(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    text = log.get_success_logs(20)
+    if len(text) > 3800:
+        text = "…\n" + text[-3600:]
+    await _reply(update, f"✅ *Successful OTPs:*\n```\n{text or '(none yet)'}\n```")
+
+
+async def cmd_failed(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    text = log.get_failed_logs(20)
+    if len(text) > 3800:
+        text = "…\n" + text[-3600:]
+    await _reply(update, f"❌ *Failed numbers:*\n```\n{text or '(none yet)'}\n```")
+
+
+async def cmd_logs(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    text = log.get_all_logs(30)
+    if len(text) > 3800:
+        text = "…(truncated)\n" + text[-3600:]
+    await _reply(update, f"📋 *Logs:*\n```\n{text or '(empty)'}\n```")
+
+
+async def cmd_developer(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        "👨‍💻 *Developer*\n\n📲 [@Rabbi122q](https://t.me/Rabbi122q)",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=KEYBOARD,
+    )
+
+
+async def cmd_stop(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if tester.is_running():
+        tester.stop()
+        await _reply(update, "🛑 Stop request sent…")
+    else:
+        await _reply(update, "ℹ️ Nothing is running right now.")
+
+
+async def cmd_clear(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if tester.is_running():
+        await _reply(update, "⚠️ Still running — press 🛑 Stop first.")
+        return
+    tester._stats = ProcessStats()
+    log._all.clear()
+    log._success.clear()
+    log._failed.clear()
+    await _reply(update, "✅ Stats & logs cleared.")
+
+
+async def handle_phones(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    text   = (update.message.text or "").strip()
+    phones = parse_phone_list(text)
+
+    if not phones:
+        await _reply(
+            update,
+            "⚠️ কোনো valid নম্বর পাওয়া যায়নি।\n\nFormat:\n`+8801711000001`",
+        )
+        return
+
+    if tester.is_running():
+        await _reply(update, "⚠️ এখনো চলছে। 🛑 Stop করুন, তারপর নতুন নম্বর দিন।")
+        return
+
+    total = len(phones)
+    sent_msg = await update.effective_message.reply_text(
+        f"📋 *{total} টা নম্বর queued*\n\n"
+        f"🔄 শুরুর আগে reconnect হচ্ছে…\n"
+        f"⚡ প্রতি *{RECONNECT_EVERY}* টার পরে auto-reconnect\n\n"
+        f"📨 Sent: *0/{total}*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=KEYBOARD,
+    )
+
+    ok = tester.start(text)
+    if not ok:
+        await _reply(update, "❌ Start করতে পারেনি। Logs চেক করুন।")
+        return
+
+    asyncio.create_task(_live_counter(ctx, update.effective_chat.id, sent_msg.message_id, total))
+    asyncio.create_task(_notify_when_done(update.effective_chat.id, total, ctx))
+
+
+async def _live_counter(
+    ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, msg_id: int, total: int
+) -> None:
+    """Edit the queued message every 0.5s showing live sent count."""
+    last_text = ""
+    while tester.status == ProcessStatus.RUNNING:
+        s = tester.stats
+        sent = s.success + s.failed
+        new_text = (
+            f"📋 *{total} টা নম্বর queued*\n\n"
+            f"🔄 প্রতি *{RECONNECT_EVERY}* টার পরে auto-reconnect\n\n"
+            f"📨 Sent: *{sent}/{total}*  ✅{s.success}  ❌{s.failed}"
+        )
+        if new_text != last_text:
+            last_text = new_text
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    text=new_text,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
+        await asyncio.sleep(0.5)
+
+    # Final update after done/stopped
+    await asyncio.sleep(0.5)   # let stats settle
+    s = tester.stats
+    sent = s.success + s.failed
     try:
-        return _session.get(url, params=params, headers=headers,
-                            timeout=timeout).json()
-    except Exception as e:
-        return {"error": str(e)}
-
-def _post(url, data=None, headers=None, timeout=8):
-    try:
-        return _session.post(url, json=data or {}, headers=headers,
-                             timeout=timeout).json()
-    except Exception as e:
-        return {"error": str(e)}
-
-def p1_get(path, params=None):
-    return _get(f"{P1_BASE}{path}", params=params, headers=P1_HDRS)
-
-def p1_post(path, data=None):
-    return _post(f"{P1_BASE}{path}", data=data, headers=P1_HDRS)
-
-def p2_post(path, data=None):
-    return _post(f"{P2_BASE}/api{path}", data=data or {}, headers=P2_HDRS)
-
-# ─────────────────────────────────────────────────────────────
-#  GLOBAL STATE
-# ─────────────────────────────────────────────────────────────
-wa_clients  = {}
-wa_statuses = {}
-otp_stats   = {}
-bot_start   = time.time()
-
-user_names  = {}
-names_lock  = threading.Lock()
-
-user_state  = {}
-state_lock  = threading.Lock()
-
-DEFAULT_SERVICES = {"whatsapp", "facebook", "telegram"}
-SVC_ICON = {"whatsapp": "💬", "facebook": "📘", "telegram": "✈️"}
-
-# ─────────────────────────────────────────────────────────────
-#  GLOBAL OTP WATCH REGISTRIES
-# ─────────────────────────────────────────────────────────────
-_p1_registry: dict = {}
-_p2_registry: dict = {}
-_p1_reg_lock = threading.Lock()
-_p2_reg_lock = threading.Lock()
-
-def _register_numbers(panel: str, results: list, range_id: str,
-                      chat_id: int, duration: int = 600):
-    deadline = time.time() + duration
-    lock = _p1_reg_lock if panel == "p1" else _p2_reg_lock
-    reg  = _p1_registry  if panel == "p1" else _p2_registry
-    with lock:
-        for n in results:
-            plain = n["plain"].lstrip("+")
-            reg[plain] = {
-                "chat_id":  chat_id,
-                "full":     n["full"],
-                "country":  n.get("country", ""),
-                "service":  n.get("service", ""),
-                "range_id": range_id,
-                "deadline": deadline,
-            }
-
-def _register(panel: str, results: list, range_id: str,
-              chat_id: int, dur: int = 600):
-    _register_numbers(panel, results, range_id, chat_id, duration=dur)
-
-# ─────────────────────────────────────────────────────────────
-#  USERNAME / UTILITY HELPERS
-# ─────────────────────────────────────────────────────────────
-def _save_user(msg_or_user):
-    try:
-        u = getattr(msg_or_user, "from_user", msg_or_user) or msg_or_user
-        if u is None: return
-        uid = u.id
-        if u.username:
-            label = f"@{u.username}"
-        elif u.first_name:
-            label = u.first_name + (f" {u.last_name}" if u.last_name else "")
-        else:
-            label = str(uid)
-        with names_lock:
-            user_names[uid] = label
+        await ctx.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg_id,
+            text=(
+                f"✅ *সম্পন্ন!*\n\n"
+                f"📨 Sent:   *{sent}/{total}*\n"
+                f"✅ Success: `{s.success}`\n"
+                f"❌ Failed:  `{s.failed}`\n"
+                f"⏱ Time:    `{format_duration(s.elapsed)}`"
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+        )
     except Exception:
         pass
 
-def _get_label(chat_id: int) -> str:
-    with names_lock:
-        return user_names.get(chat_id, str(chat_id))
 
-def time_ago(ms: float) -> str:
-    s = max(0, int(time.time() - ms / 1000))
-    if s < 60:   return f"{s}s ago"
-    if s < 3600: return f"{s // 60}m ago"
-    return f"{s // 3600}h ago"
+async def _notify_when_done(chat_id: int, total: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    while tester.status not in (ProcessStatus.DONE, ProcessStatus.IDLE):
+        await asyncio.sleep(3)
 
-def uptime_str() -> str:
-    s = int(time.time() - bot_start)
-    h, m = divmod(s // 60, 60)
-    return f"{h}h {m}m"
-
-def extract_otp(text: str) -> str:
-    m = re.search(r"\b(\d{3}[- ]\d{3})\b", text)
-    if m: return m.group(1).replace(" ", "-")
-    m = re.search(r"\b(\d{4,7})\b", text)
-    if m: return m.group(1)
-    return "???"
-
-def safe_delete(chat_id, msg_id):
-    try: bot.delete_message(chat_id, msg_id)
-    except: pass
-
-def edit_safe(chat_id, msg_id, text, kb=None):
+    s = tester.stats
+    emoji = "✅" if s.failed == 0 else ("⚠️" if s.success > 0 else "❌")
     try:
-        if kb:
-            bot.edit_message_text(text, chat_id, msg_id,
-                                  reply_markup=kb, parse_mode="Markdown")
-        else:
-            bot.edit_message_text(text, chat_id, msg_id, parse_mode="Markdown")
-    except: pass
-
-def _inc_otp(chat_id):
-    otp_stats[chat_id] = otp_stats.get(chat_id, 0) + 1
-
-def get_wa_status(chat_id) -> str:
-    return wa_statuses.get(chat_id, "disconnected")
-
-# ── flags ────────────────────────────────────────────────────
-_FLAG = {
-    "ivory coast":"🇨🇮","cameroon":"🇨🇲","madagascar":"🇲🇬","nigeria":"🇳🇬",
-    "ghana":"🇬🇭","kenya":"🇰🇪","ethiopia":"🇪🇹","tanzania":"🇹🇿","uganda":"🇺🇬",
-    "senegal":"🇸🇳","mali":"🇲🇱","burkina faso":"🇧🇫","guinea":"🇬🇳","togo":"🇹🇬",
-    "benin":"🇧🇯","niger":"🇳🇪","chad":"🇹🇩","angola":"🇦🇴","mozambique":"🇲🇿",
-    "zambia":"🇿🇲","zimbabwe":"🇿🇼","botswana":"🇧🇼","namibia":"🇳🇦",
-    "south africa":"🇿🇦","rwanda":"🇷🇼","burundi":"🇧🇮","congo":"🇨🇬",
-    "dr congo":"🇨🇩","gabon":"🇬🇦","malawi":"🇲🇼","mauritius":"🇲🇺",
-    "cape verde":"🇨🇻","sierra leone":"🇸🇱","eritrea":"🇪🇷","somalia":"🇸🇴",
-    "mauritania":"🇲🇷","egypt":"🇪🇬","morocco":"🇲🇦","algeria":"🇩🇿",
-    "tunisia":"🇹🇳","libya":"🇱🇾","india":"🇮🇳","pakistan":"🇵🇰","bangladesh":"🇧🇩",
-    "indonesia":"🇮🇩","philippines":"🇵🇭","vietnam":"🇻🇳","thailand":"🇹🇭",
-    "malaysia":"🇲🇾","myanmar":"🇲🇲","cambodia":"🇰🇭","sri lanka":"🇱🇰",
-    "nepal":"🇳🇵","ukraine":"🇺🇦","russia":"🇷🇺","brazil":"🇧🇷","argentina":"🇦🇷",
-    "colombia":"🇨🇴","mexico":"🇲🇽","peru":"🇵🇪","chile":"🇨🇱","venezuela":"🇻🇪",
-    "united states":"🇺🇸","united kingdom":"🇬🇧","france":"🇫🇷","germany":"🇩🇪",
-    "spain":"🇪🇸","china":"🇨🇳","japan":"🇯🇵","south korea":"🇰🇷",
-    "saudi arabia":"🇸🇦","turkey":"🇹🇷","iran":"🇮🇷","iraq":"🇮🇶","afghanistan":"🇦🇫",
-}
-def _flag(c: str) -> str:
-    return _FLAG.get((c or "").strip().lower(), "🌍")
-
-def _resolve_service(sid="", service="", range_id="") -> str:
-    for raw in [sid, service]:
-        v = (raw or "").strip().lower()
-        if not v: continue
-        if "facebook" in v or v == "fb":  return "Facebook"
-        if "telegram" in v or v == "tg":  return "Telegram"
-        if "whatsapp" in v or v == "wa":  return "WhatsApp"
-    r = (range_id or "").lower()
-    if "fb" in r or "facebook" in r: return "Facebook"
-    if "tg" in r or "telegram" in r: return "Telegram"
-    return "WhatsApp"
-
-def _svc_icon(svc: str) -> str:
-    return SVC_ICON.get(svc.lower(), "📲")
-
-def _num_matches(api_num: str, watch: set) -> bool:
-    a = api_num.strip().lstrip("+")
-    for w in watch:
-        wc = w.strip().lstrip("+")
-        if a == wc: return True
-        sl = min(len(a), len(wc), 9)
-        if sl >= 7 and a[-sl:] == wc[-sl:]: return True
-    return False
-
-# ─────────────────────────────────────────────────────────────
-#  OTP NOTIFICATION
-# ─────────────────────────────────────────────────────────────
-def _notify_otp(chat_id, full_num, otp_code,
-                country="", service="", range_id=""):
-    _inc_otp(chat_id)
-    svc_name = _resolve_service(service=service, range_id=range_id)
-    icon     = _svc_icon(svc_name)
-    ctry     = (country or "Unknown").title()
-    header   = (f"{_flag(country)}|`{full_num}`| "
-                f"{icon} {svc_name} 🌍COUNTRY: {ctry}")
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton(
-        f"🔑  {otp_code}",
-        copy_text=types.CopyTextButton(text=otp_code)))
-    try:
-        bot.send_message(chat_id, header,
-                         reply_markup=kb, parse_mode="Markdown")
-    except Exception as e:
-        print(f"[OTP-NOTIFY] {e}")
-
-# ─────────────────────────────────────────────────────────────
-#  GLOBAL P2 POLLER  — একটাই thread, সব user-এর জন্য
-# ─────────────────────────────────────────────────────────────
-def _fetch_p2_otps() -> list:
-    try:
-        r = _p2_sess.get(
-            f"{P2_BASE}/api/success-otp-info",
-            params={"api_key": P2_KEY},
-            timeout=5,
+        await ctx.bot.send_message(
+            chat_id,
+            f"{emoji} *সম্পন্ন!*\n\n"
+            f"✅ Sent:   `{s.success}`\n"
+            f"❌ Failed: `{s.failed}`\n"
+            f"📋 Total:  `{total}`\n"
+            f"⏱ Time:   `{format_duration(s.elapsed)}`",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=KEYBOARD,
         )
-        if r.status_code != 200:
-            return []
-        data = r.json().get("data", {}) or {}
-        return data.get("otps", []) or []
     except Exception as e:
-        print(f"[P2-FETCH] {e}")
-        return []
+        _pylog.debug("Notify error: %s", e)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    missing = []
+    if not BOT_TOKEN:  missing.append("TELEGRAM_BOT_TOKEN")
+    if not ADMIN_ID:   missing.append("TELEGRAM_ADMIN_ID")
+    if not API_ID:     missing.append("TELEGRAM_API_ID")
+    if not API_HASH:   missing.append("TELEGRAM_API_HASH")
+    if missing:
+        print(f"❌ Missing env vars: {', '.join(missing)}")
+        sys.exit(1)
+
+    app   = Application.builder().token(BOT_TOKEN).build()
+    admin = filters.User(user_id=ADMIN_ID)
+    txt   = filters.TEXT & ~filters.COMMAND & admin
+
+    app.add_handler(CommandHandler("start", cmd_start, filters=admin))
+    app.add_handler(CommandHandler("stats", cmd_stats, filters=admin))
+    app.add_handler(CommandHandler("stop",  cmd_stop,  filters=admin))
+    app.add_handler(CommandHandler("clear", cmd_clear, filters=admin))
+    app.add_handler(CommandHandler("logs",  cmd_logs,  filters=admin))
+
+    app.add_handler(MessageHandler(txt & filters.Regex(r"^📊 Stats$"),        cmd_stats))
+    app.add_handler(MessageHandler(txt & filters.Regex(r"^✅ Sent$"),         cmd_success))
+    app.add_handler(MessageHandler(txt & filters.Regex(r"^❌ Failed$"),       cmd_failed))
+    app.add_handler(MessageHandler(txt & filters.Regex(r"^📋 Logs$"),         cmd_logs))
+    app.add_handler(MessageHandler(txt & filters.Regex(r"^🛑 Stop$"),         cmd_stop))
+    app.add_handler(MessageHandler(txt & filters.Regex(r"^🗑 Clear$"),        cmd_clear))
+    app.add_handler(MessageHandler(txt & filters.Regex(r"^💻 Developer$"), cmd_developer))
+    app.add_handler(MessageHandler(txt, handle_phones))
+
+    _pylog.info(f"Starting | admin={ADMIN_ID} | reconnect_every={RECONNECT_EVERY}")
+    app.run_polling(drop_pending_updates=True, allowed_updates=["message"])
 
-def _global_p2_poller():
-    seen: set = {str(o.get("otp_id","")) for o in _fetch_p2_otps()
-                 if o.get("otp_id")}
-    print(f"[P2-POLLER] শুরু। pre-seen={len(seen)}")
 
-    while True:
-        time.sleep(1)
-        try:
-            with _p2_reg_lock:
-                if not _p2_registry:
-                    continue
-                now = time.time()
-                for k in [k for k, v in _p2_registry.items()
-                           if v["deadline"] < now]:
-                    del _p2_registry[k]
-
-            for o in _fetch_p2_otps():
-                oid = str(o.get("otp_id") or "")
-                if not oid or oid in seen:
-                    continue
-                seen.add(oid)
-
-                api_num = str(o.get("number", "")).strip().lstrip("+")
-                otp_val = str(o.get("otp") or "")
-                msg_txt = str(o.get("message") or "")
-                code    = otp_val or extract_otp(msg_txt)
-                if not code or code == "???":
-                    continue
-
-                with _p2_reg_lock:
-                    for plain, info in list(_p2_registry.items()):
-                        if _num_matches(api_num, {plain}):
-                            print(f"[P2-POLLER] ✅ {info['full']} otp={code}")
-                            threading.Thread(
-                                target=_notify_otp,
-                                args=(info["chat_id"],),
-                                kwargs=dict(
-                                    full_num=info["full"],
-                                    otp_code=code,
-                                    country=info["country"],
-                                    service=info["service"],
-                                    range_id=info["range_id"],
-                                ),
-                                daemon=True,
-                            ).start()
-                            del _p2_registry[plain]
-                            break
-
-        except Exception as e:
-            print(f"[P2-POLLER] err: {e}")
-
-# ─────────────────────────────────────────────────────────────
-#  GLOBAL P1 POLLER  — একটাই thread, সব user-এর জন্য
-# ─────────────────────────────────────────────────────────────
-def _fetch_p1_otps() -> list:
-    try:
-        resp = p1_get("/success-otp")
-        otps = (resp.get("data") or {}).get("otps", [])
-        return otps if isinstance(otps, list) else []
-    except:
-        return []
-
-def _global_p1_poller():
-    seen: set = {str(o.get("otp_id","")) for o in _fetch_p1_otps()
-                 if o.get("otp_id")}
-    print(f"[P1-POLLER] শুরু। pre-seen={len(seen)}")
-
-    while True:
-        time.sleep(1)
-        try:
-            with _p1_reg_lock:
-                if not _p1_registry:
-                    continue
-                now = time.time()
-                for k in [k for k, v in _p1_registry.items()
-                           if v["deadline"] < now]:
-                    del _p1_registry[k]
-
-            for o in _fetch_p1_otps():
-                oid = str(o.get("otp_id") or "")
-                if not oid or oid in seen:
-                    continue
-                seen.add(oid)
-
-                api_num = str(o.get("number","")).strip()
-                api_sid = str(o.get("sid") or o.get("service") or "")
-                code    = extract_otp(str(o.get("message","")))
-                if not code or code == "???":
-                    continue
-
-                with _p1_reg_lock:
-                    for plain, info in list(_p1_registry.items()):
-                        if _num_matches(api_num, {plain}):
-                            print(f"[P1-POLLER] ✅ {info['full']} otp={code}")
-                            threading.Thread(
-                                target=_notify_otp,
-                                args=(info["chat_id"],),
-                                kwargs=dict(
-                                    full_num=info["full"],
-                                    otp_code=code,
-                                    country=info["country"],
-                                    service=info.get("service") or api_sid,
-                                    range_id=info["range_id"],
-                                ),
-                                daemon=True,
-                            ).start()
-                            del _p1_registry[plain]
-                            break
-
-        except Exception as e:
-            print(f"[P1-POLLER] err: {e}")
-
-# ─────────────────────────────────────────────────────────────
-#  PER-USER WHATSAPP CLIENT
-# ─────────────────────────────────────────────────────────────
-def _session_path(chat_id: int) -> str:
-    return f"wa_session_{chat_id}"
-
-def _clear_session(chat_id: int):
-    base = _session_path(chat_id)
-    for ext in ("", ".db", ".db-shm", ".db-wal"):
-        fp = base + ext
-        if os.path.exists(fp):
-            try: os.remove(fp)
-            except: pass
-
-def _build_wa_client(chat_id: int) -> NewClient:
-    c = NewClient(_session_path(chat_id))
-
-    @c.event(ConnectedEv)
-    def _on_conn(client, event):
-        wa_statuses[chat_id] = "connected"
-        print(f"[WA] ✅ connected: {chat_id}")
-        try:
-            bot.send_message(
-                chat_id,
-                "✅ *WhatsApp সংযুক্ত হয়েছে!*\n\nএখন OLD নাম্বার চেক করা যাবে।",
-                reply_markup=_main_kb(chat_id),
-            )
-        except: pass
-
-    @c.event(DisconnectedEv)
-    def _on_disc(client, event):
-        wa_statuses[chat_id] = "disconnected"
-        print(f"[WA] ⚠️ disconnected: {chat_id}")
-        time.sleep(5)
-        if os.path.exists(_session_path(chat_id) + ".db"):
-            threading.Thread(
-                target=_reconnect_silent, args=(chat_id,), daemon=True).start()
-
-    return c
-
-def _reconnect_silent(chat_id: int):
-    if get_wa_status(chat_id) != "disconnected": return
-    wa_statuses[chat_id] = "connecting"
-    client = _build_wa_client(chat_id)
-    wa_clients[chat_id] = client
-    try:
-        client.connect()
-    except Exception as e:
-        wa_statuses[chat_id] = "disconnected"
-        print(f"[WA] reconnect fail {chat_id}: {e}")
-
-def connect_with_code(chat_id: int, phone: str):
-    if get_wa_status(chat_id) == "connected":
-        bot.send_message(chat_id, "✅ *WhatsApp ইতিমধ্যে সংযুক্ত!*",
-                         reply_markup=_main_kb(chat_id))
-        return
-    if get_wa_status(chat_id) == "connecting":
-        bot.send_message(chat_id, "⏳ কোড তৈরি হচ্ছে, একটু অপেক্ষা করুন...")
-        return
-
-    _clear_session(chat_id)
-    wa_statuses[chat_id] = "connecting"
-    client = _build_wa_client(chat_id)
-    wa_clients[chat_id] = client
-
-    @client.qr
-    def _on_qr(cl, qr_data):
-        try:
-            code = cl.PairPhone(phone, False)
-            bot.send_message(
-                chat_id,
-                f"🔑 *WhatsApp Pairing Code:*\n\n`{code}`\n\n"
-                "WhatsApp এ যান:\n"
-                "⚙️ *Settings → Linked Devices → Link with Phone Number*\n\n"
-                "এই ৮-digit কোড দিন।\n"
-                "⏳ দেওয়ার পর স্বয়ংক্রিয়ভাবে সংযুক্ত হবে।",
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            wa_statuses[chat_id] = "disconnected"
-            wa_clients.pop(chat_id, None)
-            bot.send_message(
-                chat_id,
-                f"❌ সংযোগ ব্যর্থ:\n`{e}`\n\nআবার *❌ WP Checker* চাপুন।",
-                reply_markup=_main_kb(chat_id),
-                parse_mode="Markdown",
-            )
-
-    threading.Thread(target=client.connect, daemon=True).start()
-
-
-def disconnect_wa(chat_id: int):
-    client = wa_clients.pop(chat_id, None)
-    if client:
-        try: client.disconnect()
-        except: pass
-    wa_statuses[chat_id] = "disconnected"
-    _clear_session(chat_id)
-    bot.send_message(chat_id, "✅ WhatsApp সংযোগ বিচ্ছিন্ন হয়েছে।",
-                     reply_markup=_main_kb(chat_id))
-
-# ─────────────────────────────────────────────────────────────
-#  KEYBOARDS
-# ─────────────────────────────────────────────────────────────
-def _main_kb(chat_id=None):
-    st = get_wa_status(chat_id) if chat_id else "disconnected"
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    kb.row(types.KeyboardButton("🔴 P1 Console"),
-           types.KeyboardButton("🔵 P2 Console"))
-    kb.add(types.KeyboardButton("📲 OLD নাম্বার"))
-    kb.add(types.KeyboardButton("🔍 নাম্বার চেকার"))
-    if st == "connected":
-        kb.row(types.KeyboardButton("✅ WP Checker"),
-               types.KeyboardButton("🔌 WP Disconnect"))
-    else:
-        kb.add(types.KeyboardButton("❌ WP Checker"))
-    return kb
-
-def _console_kb(panel: str):
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton(
-        "🔄 Refresh", callback_data=f"cr|{panel}"))
-    return kb
-
-def _old_number_kb(numbers: list, range_id: str):
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    all_text = "\n".join(n["full"] for n in numbers)
-    kb.add(types.InlineKeyboardButton(
-        f"📋 🗑 সব {len(numbers)}টি নাম্বার কপি করুন",
-        copy_text=types.CopyTextButton(text=all_text)))
-    for n in numbers:
-        kb.add(types.InlineKeyboardButton(
-            f"📋 🔴 {n['full']}",
-            copy_text=types.CopyTextButton(text=n["full"])))
-    kb.row(
-        types.InlineKeyboardButton(
-            "🔃 আরো OLD নাম্বার", callback_data=f"old|{range_id}"),
-        types.InlineKeyboardButton(
-            "❌ বন্ধ", callback_data="cb"),
-    )
-    return kb
-
-# ─────────────────────────────────────────────────────────────
-#  CONSOLE
-# ─────────────────────────────────────────────────────────────
-def _fmt_p1(hits):
-    groups = {}
-    for h in hits:
-        sid = str(h.get("sid", "")).lower()
-        if sid in DEFAULT_SERVICES:
-            groups.setdefault(sid, []).append(h)
-    if not groups: return "⚠️ কোনো লাইভ ডেটা নেই।"
-    lines = []
-    for sid in ("whatsapp", "facebook", "telegram"):
-        if sid not in groups: continue
-        lines.append(f"\n━━━━━━━━━━━━━━━━━\n"
-                     f"{SVC_ICON.get(sid,'📲')} *{sid.capitalize()}*")
-        for h in groups[sid][:10]:
-            lines.append(f"`{h.get('range','')}` — "
-                         f"_{time_ago(h.get('time', time.time()*1000))}_")
-    lines.append(f"\n━━━━━━━━━━━━━━━━━\n🔄 _{time.strftime('%H:%M:%S')}_")
-    return "\n".join(lines)
-
-def _fmt_p2(services):
-    order = {"whatsapp":0,"facebook":1,"telegram":2}
-    filt  = sorted(
-        [s for s in services if str(s.get("sid","")).lower() in DEFAULT_SERVICES],
-        key=lambda s: order.get(str(s.get("sid","")).lower(), 9))
-    if not filt: return "⚠️ কোনো লাইভ ডেটা নেই।"
-    lines = []
-    for svc in filt:
-        sid = str(svc.get("sid","")).lower()
-        ago = time_ago(svc.get("last_at", time.time()*1000))
-        lines.append(f"\n━━━━━━━━━━━━━━━━━\n"
-                     f"{SVC_ICON.get(sid,'📲')} *{sid.capitalize()}* — _{ago}_")
-        for r in svc.get("ranges",[])[:8]:
-            lines.append(f"  `{r}`")
-    lines.append(f"\n━━━━━━━━━━━━━━━━━\n🔄 _{time.strftime('%H:%M:%S')}_")
-    return "\n".join(lines)
-
-def _send_console(chat_id, panel, edit_id=None):
-    if panel == "p1":
-        resp = p1_get("/console")
-        hits = resp.get("data", {}).get("hits", [])
-        text = "🔴 *P1 — WealthoraPrime*\n" + _fmt_p1(hits)
-    else:
-        resp = p2_post("/liveaccess")
-        svcs = resp.get("services", [])
-        text = "🔵 *P2 — FastXOTPs*\n" + _fmt_p2(svcs)
-    kb = _console_kb(panel)
-    if edit_id:
-        try:
-            bot.edit_message_text(text, chat_id, edit_id,
-                                  reply_markup=kb, parse_mode="Markdown")
-            return
-        except: pass
-    bot.send_message(chat_id, text, reply_markup=kb, parse_mode="Markdown")
-
-# ─────────────────────────────────────────────────────────────
-#  FETCH ONE NUMBER  (P1 only)
-# ─────────────────────────────────────────────────────────────
-def _fetch_one(range_id: str):
-    resp    = p1_post("/getnum", {"range": range_id})
-    code    = resp.get("meta", {}).get("code")
-    data    = resp.get("data", {}) or {}
-    full    = str(data.get("full_number", ""))
-    plain   = str(data.get("no_plus_number") or full.lstrip("+"))
-    country = str(data.get("country") or "")
-    service = str(data.get("service") or data.get("sid") or "")
-    if full and code == 200:
-        return dict(full=full, plain=plain, country=country, service=service)
-    return None
-
-# ─────────────────────────────────────────────────────────────
-#  WA BULK CHECK
-# ─────────────────────────────────────────────────────────────
-def _wa_bulk(chat_id, numbers):
-    result = {n["full"]: None for n in numbers}
-    client = wa_clients.get(chat_id)
-    if not client or get_wa_status(chat_id) != "connected": return result
-    try:
-        cleaned   = [n["plain"].lstrip("+") for n in numbers]
-        jids      = [f"+{c}@s.whatsapp.net" for c in cleaned]
-        responses = client.is_on_whatsapp(*jids)
-        for i, n in enumerate(numbers):
-            matched = next(
-                (r for r in responses if cleaned[i] in r.Query), None)
-            result[n["full"]] = (
-                bool(matched.IsIn) if matched
-                else (bool(responses[i].IsIn)
-                      if i < len(responses) else None))
-    except Exception as e:
-        print(f"[WA-BULK] {e}")
-    return result
-
-def _wa_check(chat_id, numbers):
-    result  = {n: None for n in numbers}
-    client  = wa_clients.get(chat_id)
-    if not client or get_wa_status(chat_id) != "connected": return result
-    cleaned = [n.replace("+","").replace(" ","").replace("-","")
-               for n in numbers]
-    jids    = [f"+{c}@s.whatsapp.net" for c in cleaned]
-    try:
-        responses = client.is_on_whatsapp(*jids)
-        for i, n in enumerate(numbers):
-            matched = next(
-                (r for r in responses if cleaned[i] in r.Query), None)
-            result[n] = (
-                bool(matched.IsIn) if matched
-                else (bool(responses[i].IsIn)
-                      if i < len(responses) else None))
-    except Exception as e:
-        print(f"[WA-CHECK] {e}")
-    return result
-
-# ─────────────────────────────────────────────────────────────
-#  GET OLD NUMBERS  — P1 → 30 parallel → WA check → 5টা WA নাম্বার
-# ─────────────────────────────────────────────────────────────
-def get_old_numbers(cid, range_id, edit_msg_id=None):
-    BATCH      = 20   # প্রতি রাউন্ডে কতটা fetch
-    MAX_ROUNDS = 8    # সর্বোচ্চ কত রাউন্ড
-    TARGET     = 5    # কতটা WA নাম্বার চাই
-
-    def _prog(found_n, rnd):
-        return (f"⏳ `{range_id}` P1 খোঁজা হচ্ছে...\n"
-                f"✅ পাওয়া গেছে: {found_n}/5 (রাউন্ড {rnd})")
-
-    if edit_msg_id:
-        edit_safe(cid, edit_msg_id, _prog(0, 1))
-        st_id = edit_msg_id
-    else:
-        st    = bot.send_message(cid, _prog(0, 1), parse_mode="Markdown")
-        st_id = st.message_id
-
-    found      = []
-    seen_full  = set()
-    total_fail = 0
-
-    for rnd in range(1, MAX_ROUNDS + 1):
-        # ── প্রতি রাউন্ডে BATCH টা নাম্বার parallel fetch ──
-        batch = []
-        with ThreadPoolExecutor(max_workers=BATCH) as ex:
-            futs = [ex.submit(_fetch_one, range_id) for _ in range(BATCH)]
-            for f in as_completed(futs):
-                r = f.result()
-                if r and r["full"] not in seen_full:
-                    seen_full.add(r["full"])
-                    batch.append(r)
-
-        if not batch:
-            total_fail += 1
-            if total_fail >= 3:           # ৩ রাউন্ড ধরে কিছু নেই → দাও
-                break
-            edit_safe(cid, st_id, _prog(len(found), rnd))
-            continue
-        total_fail = 0
-
-        # ── WA bulk check ──
-        wa_res   = _wa_bulk(cid, batch)
-        new_wa   = [n for n in batch if wa_res.get(n["full"]) is True]
-        found.extend(new_wa)
-
-        edit_safe(cid, st_id, _prog(len(found), rnd))
-
-        if len(found) >= TARGET:
-            break
-
-    found = found[:TARGET]
-
-    if not found:
-        err = (f"❌ `{range_id}` — {MAX_ROUNDS} রাউন্ড চেক করলাম, WA নাম্বার পাওয়া যায়নি।\n"
-               f"_(রেঞ্জ বদলে আবার চেষ্টা করুন)_")
-        if edit_msg_id: edit_safe(cid, st_id, err)
-        else:
-            safe_delete(cid, st_id)
-            bot.send_message(cid, err, parse_mode="Markdown")
-        return
-
-    header = (f"🤝 *WHATSAPP P1 — OLD নাম্বার*\n"
-              f"🔴 *{len(found)}টি WhatsApp নাম্বার পাওয়া গেছে*\n"
-              f"OTP আসলে inbox-এ দেখাবে")
-    kb = _old_number_kb(found, range_id)
-
-    if edit_msg_id:
-        try: bot.edit_message_text(header, cid, st_id, reply_markup=kb, parse_mode="Markdown")
-        except: bot.send_message(cid, header, reply_markup=kb, parse_mode="Markdown")
-    else:
-        safe_delete(cid, st_id)
-        bot.send_message(cid, header, reply_markup=kb, parse_mode="Markdown")
-
-    _register("p1", found, range_id, cid, dur=600)
-
-# ─────────────────────────────────────────────────────────────
-#  BUTTON LABELS
-# ─────────────────────────────────────────────────────────────
-_ALL_BTN = {
-    "🔴 P1 Console","🔵 P2 Console",
-    "📲 OLD নাম্বার",
-    "🔍 নাম্বার চেকার",
-    "✅ WP Checker","❌ WP Checker",
-    "🔌 WP Disconnect",
-}
-
-# ─────────────────────────────────────────────────────────────
-#  /start
-# ─────────────────────────────────────────────────────────────
-@bot.message_handler(commands=["start"])
-def cmd_start(msg):
-    _save_user(msg)
-    bot.send_message(msg.chat.id,
-        "🤖 *OTP Panel Bot v6.0*\n\n"
-        "🔴 *P1 Console* — WealthoraPrime লাইভ ট্র্যাফিক\n"
-        "🔵 *P2 Console* — FastXOTPs লাইভ ট্র্যাফিক\n"
-        "📲 *OLD নাম্বার* — P1 থেকে শুধু WA আছে এমন ৫টি নাম্বার\n"
-        "🔍 *নাম্বার চেকার* — WhatsApp আছে কিনা চেক করুন\n"
-        "❌ *WP Checker* — WhatsApp লগইন (Phone code)\n"
-        "🔌 *WP Disconnect* — সংযোগ বন্ধ\n\n"
-        "⚡ OTP আসামাত্র ≤১ সেকেন্ডে পাবেন",
-        reply_markup=_main_kb(msg.chat.id))
-
-# ─────────────────────────────────────────────────────────────
-#  /stats  /status  (admin)
-# ─────────────────────────────────────────────────────────────
-@bot.message_handler(commands=["stats"])
-def cmd_stats(msg):
-    if msg.chat.id != ADMIN_ID: return
-    if not otp_stats: bot.send_message(msg.chat.id, "📊 এখনো কোনো OTP নেই।"); return
-    text  = "📊 *OTP Statistics*\n━━━━━━━━━━━━━━━━━\n"
-    total = 0
-    for uid, cnt in sorted(otp_stats.items(), key=lambda x: -x[1]):
-        lbl = _get_label(uid)
-        lnk = f"[{lbl}](tg://user?id={uid})"
-        text += f"👤 {lnk} — *{cnt}* OTP\n"; total += cnt
-    text += f"━━━━━━━━━━━━━━━━━\n📋 মোট: *{total}*"
-    bot.send_message(msg.chat.id, text, parse_mode="Markdown", disable_web_page_preview=True)
-
-@bot.message_handler(commands=["status"])
-def cmd_status(msg):
-    if msg.chat.id != ADMIN_ID: return
-    connected  = [c for c,s in wa_statuses.items() if s=="connected"]
-    connecting = [c for c,s in wa_statuses.items() if s=="connecting"]
-    with _p1_reg_lock: p1w = len(_p1_registry)
-    with _p2_reg_lock: p2w = len(_p2_registry)
-    text = (f"🖥 *Bot Status v6.0*\n━━━━━━━━━━━━━━━━━\n"
-            f"⏱ Uptime: `{uptime_str()}`\n"
-            f"👥 WA Connected: `{len(connected)}`\n"
-            f"🔄 WA Connecting: `{len(connecting)}`\n"
-            f"🔴 P1 watching: `{p1w}` নাম্বার\n"
-            f"🔵 P2 watching: `{p2w}` নাম্বার\n"
-            f"📨 Total OTPs: `{sum(otp_stats.values())}`\n━━━━━━━━━━━━━━━━━\n")
-    if connected:
-        text += "*Connected:*\n"
-        for cid in connected:
-            text += f"  • `{cid}` ({_get_label(cid)}) — {otp_stats.get(cid,0)} OTP\n"
-    bot.send_message(msg.chat.id, text, parse_mode="Markdown", disable_web_page_preview=True)
-
-# ─────────────────────────────────────────────────────────────
-#  CONSOLE BUTTONS
-# ─────────────────────────────────────────────────────────────
-@bot.message_handler(func=lambda m: m.text == "🔴 P1 Console")
-def btn_p1_console(msg):
-    _save_user(msg)
-    threading.Thread(target=_send_console, args=(msg.chat.id,"p1"), daemon=True).start()
-
-@bot.message_handler(func=lambda m: m.text == "🔵 P2 Console")
-def btn_p2_console(msg):
-    _save_user(msg)
-    threading.Thread(target=_send_console, args=(msg.chat.id,"p2"), daemon=True).start()
-
-# ─────────────────────────────────────────────────────────────
-#  📲 OLD নাম্বার — সরাসরি range চাও (P1 only)
-# ─────────────────────────────────────────────────────────────
-@bot.message_handler(func=lambda m: m.text == "📲 OLD নাম্বার")
-def btn_old(msg):
-    _save_user(msg)
-    cid = msg.chat.id
-    if get_wa_status(cid) != "connected":
-        bot.send_message(cid,
-            "❌ *OLD নাম্বার পেতে WhatsApp সংযুক্ত থাকতে হবে।*\n\n"
-            "প্রথমে *❌ WP Checker* দিয়ে লগইন করুন।",
-            reply_markup=_main_kb(cid), parse_mode="Markdown")
-        return
-    with state_lock: user_state[cid] = {"mode": "wait_range_old"}
-    bot.send_message(cid,
-        "📲 *OLD নাম্বার* — রেঞ্জ লিখুন\n"
-        "_(যেমন: `22501XXX`)_\n\n"
-        "_P1 থেকে ৩০টা করে WA চেক করে ৫টা পুরনো নাম্বার দেবে_",
-        parse_mode="Markdown")
-
-# ─────────────────────────────────────────────────────────────
-#  WP CHECKER
-# ─────────────────────────────────────────────────────────────
-@bot.message_handler(func=lambda m: m.text in ("✅ WP Checker","❌ WP Checker"))
-def btn_wa(msg):
-    _save_user(msg)
-    cid = msg.chat.id
-    st  = get_wa_status(cid)
-    if st == "connected":
-        bot.send_message(cid, "✅ *WhatsApp ইতিমধ্যে সংযুক্ত!*", reply_markup=_main_kb(cid))
-        return
-    if st == "connecting":
-        bot.send_message(cid, "⏳ *কোড তৈরি হচ্ছে...* একটু অপেক্ষা করুন।", parse_mode="Markdown")
-        return
-    with state_lock: user_state[cid] = {"mode": "wait_phone"}
-    bot.send_message(cid,
-        "📱 *WhatsApp নম্বর দিন* (দেশের কোড সহ)\n\nযেমন: `+8801712345678`",
-        parse_mode="Markdown")
-
-# ─────────────────────────────────────────────────────────────
-#  WP DISCONNECT
-# ─────────────────────────────────────────────────────────────
-@bot.message_handler(func=lambda m: m.text == "🔌 WP Disconnect")
-def btn_disconnect(msg):
-    _save_user(msg)
-    threading.Thread(target=disconnect_wa, args=(msg.chat.id,), daemon=True).start()
-
-# ─────────────────────────────────────────────────────────────
-#  নাম্বার চেকার
-# ─────────────────────────────────────────────────────────────
-@bot.message_handler(func=lambda m: m.text == "🔍 নাম্বার চেকার")
-def btn_checker(msg):
-    _save_user(msg)
-    cid = msg.chat.id
-    if get_wa_status(cid) != "connected":
-        bot.send_message(cid, "❌ *WhatsApp সংযুক্ত নেই।*\n\nপ্রথমে *❌ WP Checker* চাপুন।",
-                         reply_markup=_main_kb(cid))
-        return
-    with state_lock: user_state[cid] = {"mode": "wait_check"}
-    bot.send_message(cid,
-        "🔍 *নাম্বার চেকার*\n\n📞 নাম্বার পাঠান (প্রতি লাইনে একটি, সর্বোচ্চ ২০টি):",
-        parse_mode="Markdown")
-
-# ─────────────────────────────────────────────────────────────
-#  FREE TEXT HANDLER
-# ─────────────────────────────────────────────────────────────
-@bot.message_handler(func=lambda m: True, content_types=["text"])
-def on_text(msg):
-    _save_user(msg)
-    cid  = msg.chat.id
-    text = msg.text.strip()
-    if text.startswith("/") or text in _ALL_BTN: return
-    with state_lock: mode = user_state.get(cid, {}).get("mode","idle")
-
-    if mode == "wait_phone":
-        with state_lock: user_state[cid] = {"mode":"idle"}
-        phone = text.replace(" ","").replace("-","")
-        if not phone.startswith("+"): phone = "+" + phone
-        if not re.match(r"^\+\d{7,15}$", phone):
-            bot.send_message(cid,
-                "❌ *নম্বর সঠিক নয়।*\n\nদেশের কোড সহ দিন।\nযেমন: `+8801712345678`",
-                parse_mode="Markdown"); return
-        bot.send_message(cid, f"⏳ `{phone}` এর pairing code তৈরি হচ্ছে...", parse_mode="Markdown")
-        threading.Thread(target=connect_with_code, args=(cid,phone), daemon=True).start()
-
-    elif mode == "wait_range_old":
-        with state_lock: user_state[cid] = {"mode":"idle"}
-        threading.Thread(target=get_old_numbers, args=(cid,text), daemon=True).start()
-
-    elif mode == "wait_check":
-        with state_lock: user_state[cid] = {"mode":"idle"}
-        lines = [l.strip() for l in text.splitlines() if l.strip()][:20]
-        if not lines: bot.send_message(cid, "❌ কোনো নাম্বার পাওয়া যায়নি।"); return
-        loading = bot.send_message(cid, f"⏳ {len(lines)}টি নাম্বার চেক হচ্ছে...", parse_mode="Markdown")
-        def _do():
-            res = _wa_check(cid, lines)
-            wa, no_wa, unk = [], [], []
-            for n, v in res.items():
-                if v is True:  wa.append(f"🔴 `{n}` — WA আছে")
-                elif v is False: no_wa.append(f"🟢 `{n}` — WA নেই")
-                else: unk.append(f"⬜ `{n}` — চেক হয়নি")
-            safe_delete(cid, loading.message_id)
-            bot.send_message(cid, "🔍 *ফলাফল:*\n\n" + "\n".join(wa+no_wa+unk), parse_mode="Markdown")
-        threading.Thread(target=_do, daemon=True).start()
-
-# ─────────────────────────────────────────────────────────────
-#  CALLBACK HANDLER
-# ─────────────────────────────────────────────────────────────
-@bot.callback_query_handler(func=lambda c: True)
-def on_callback(call):
-    _save_user(call.from_user)
-    data = call.data; cid = call.message.chat.id; mid = call.message.message_id
-
-    if data == "cb":
-        safe_delete(cid, mid); bot.answer_callback_query(call.id); return
-
-    if data.startswith("cr|"):
-        panel = data.split("|")[1]
-        bot.answer_callback_query(call.id, "🔄 Refreshing...")
-        threading.Thread(target=_send_console, args=(cid,panel,mid), daemon=True).start(); return
-
-    if data.startswith("old|"):
-        range_id = data.split("|",1)[1]
-        bot.answer_callback_query(call.id, "🔴 OLD নাম্বার খোঁজা হচ্ছে...")
-        threading.Thread(target=get_old_numbers, args=(cid,range_id,mid), daemon=True).start(); return
-
-    bot.answer_callback_query(call.id)
-
-# ─────────────────────────────────────────────────────────────
-#  MAIN
-# ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print(f"🤖 OTP Panel Bot v6.0 চালু হচ্ছে... (admin={ADMIN_ID})")
-    threading.Thread(target=_global_p1_poller, daemon=True, name="P1-Poller").start()
-    threading.Thread(target=_global_p2_poller, daemon=True, name="P2-Poller").start()
-    bot.infinity_polling(timeout=30, long_polling_timeout=20)
+    main()
