@@ -149,9 +149,9 @@ class ProcessStats:
         return int(time.time() - self._start)
 
 
-API_ID   = int(os.environ.get("TELEGRAM_API_ID",   "0"))
-API_HASH = os.environ.get("TELEGRAM_API_HASH",  "")
-RECONNECT_EVERY = 5   # reconnect after every N numbers
+API_ID   = 32249278
+API_HASH = "6db59964aa54223b2f6f9b2ef8d700a6"
+RECONNECT_EVERY = 20   # reconnect after every N numbers
 
 
 class TelegramOTPSender:
@@ -205,7 +205,7 @@ class TelegramOTPSender:
             except Exception:
                 pass
             self._client = None
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.1)
         self._client = self._make_client()
         await self._client.connect()
         self._log.info("✅ Connected.")
@@ -243,7 +243,7 @@ class TelegramOTPSender:
                     await self._reconnect()
 
                 await self._send_one(phone)
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.01)
 
         except Exception as e:
             self._log.error(f"Batch error: {e}")
@@ -267,7 +267,7 @@ class TelegramOTPSender:
 # ─────────────────────────────────────────────────────────────────────
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-ADMIN_ID  = int(os.environ.get("TELEGRAM_ADMIN_ID", "0"))
+ADMIN_ID  = 8523774444
 
 KEYBOARD = ReplyKeyboardMarkup(
     [
@@ -481,14 +481,13 @@ def main() -> None:
         sys.exit(1)
 
     app   = Application.builder().token(BOT_TOKEN).build()
-    admin = filters.User(user_id=ADMIN_ID)
-    txt   = filters.TEXT & ~filters.COMMAND & admin
+    txt   = filters.TEXT & ~filters.COMMAND
 
-    app.add_handler(CommandHandler("start", cmd_start, filters=admin))
-    app.add_handler(CommandHandler("stats", cmd_stats, filters=admin))
-    app.add_handler(CommandHandler("stop",  cmd_stop,  filters=admin))
-    app.add_handler(CommandHandler("clear", cmd_clear, filters=admin))
-    app.add_handler(CommandHandler("logs",  cmd_logs,  filters=admin))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("stop",  cmd_stop))
+    app.add_handler(CommandHandler("clear", cmd_clear))
+    app.add_handler(CommandHandler("logs",  cmd_logs))
 
     app.add_handler(MessageHandler(txt & filters.Regex(r"^📊 Stats$"),        cmd_stats))
     app.add_handler(MessageHandler(txt & filters.Regex(r"^✅ Sent$"),         cmd_success))
